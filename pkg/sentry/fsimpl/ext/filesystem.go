@@ -27,7 +27,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 var (
@@ -125,7 +124,7 @@ func stepLocked(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, in
 			childDirent, ok := dir.childMap[name]
 			if !ok {
 				// The underlying inode does not exist on disk.
-				return nil, nil, syserror.ENOENT
+				return nil, nil, linuxerr.ENOENT
 			}
 
 			if !write {
@@ -430,7 +429,7 @@ func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 // RenameAt implements vfs.FilesystemImpl.RenameAt.
 func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldParentVD vfs.VirtualDentry, oldName string, opts vfs.RenameOptions) error {
 	if rp.Done() {
-		return syserror.ENOENT
+		return linuxerr.ENOENT
 	}
 
 	_, _, err := fs.walk(ctx, rp, false)
@@ -487,7 +486,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	}
 
 	if inode.isDir() {
-		return syserror.EISDIR
+		return linuxerr.EISDIR
 	}
 
 	return linuxerr.EROFS

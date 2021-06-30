@@ -33,7 +33,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/pipe"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // Sync implements vfs.FilesystemImpl.Sync.
@@ -251,7 +250,7 @@ func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name s
 	}
 	if child, ok := parent.children[name]; ok || parent.isSynthetic() {
 		if child == nil {
-			return nil, syserror.ENOENT
+			return nil, linuxerr.ENOENT
 		}
 		return child, nil
 	}
@@ -365,7 +364,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		return linuxerr.EEXIST
 	}
 	if parent.isDeleted() {
-		return syserror.ENOENT
+		return linuxerr.ENOENT
 	}
 	if err := fs.revalidateOne(ctx, rp.VirtualFilesystem(), parent, name, &ds); err != nil {
 		return err
@@ -411,7 +410,7 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		return err
 	}
 	if !dir && rp.MustBeDir() {
-		return syserror.ENOENT
+		return linuxerr.ENOENT
 	}
 	if parent.isSynthetic() {
 		if createInSyntheticDir == nil {
@@ -479,7 +478,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		}
 	} else {
 		if name == "." || name == ".." {
-			return syserror.EISDIR
+			return linuxerr.EISDIR
 		}
 	}
 
@@ -502,7 +501,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		child, ok = parent.children[name]
 		if ok && child == nil {
 			// Hit a negative cached entry, child doesn't exist.
-			return syserror.ENOENT
+			return linuxerr.ENOENT
 		}
 	} else {
 		child, _, err = fs.stepLocked(ctx, rp, parent, false /* mayFollowSymlinks */, &ds)
@@ -568,7 +567,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		// child must be a non-directory file.
 		if child != nil && child.isDir() {
 			vfsObj.AbortDeleteDentry(&child.vfsd) // +checklocksforce: see above.
-			return syserror.EISDIR
+			return linuxerr.EISDIR
 		}
 		if rp.MustBeDir() {
 			if child != nil {
@@ -579,7 +578,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	}
 	if parent.isSynthetic() {
 		if child == nil {
-			return syserror.ENOENT
+			return linuxerr.ENOENT
 		}
 	} else if child == nil || !child.isSynthetic() {
 		err = parent.file.unlinkAt(ctx, name, flags)
@@ -690,7 +689,7 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 			return err
 		}
 		if d.nlink == 0 {
-			return syserror.ENOENT
+			return linuxerr.ENOENT
 		}
 		if d.nlink == math.MaxUint32 {
 			return linuxerr.EMLINK
@@ -827,7 +826,7 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 	if rp.Done() {
 		// Reject attempts to open mount root directory with O_CREAT.
 		if mayCreate && rp.MustBeDir() {
-			return nil, syserror.EISDIR
+			return nil, linuxerr.EISDIR
 		}
 		if mustCreate {
 			return nil, linuxerr.EEXIST
@@ -857,7 +856,7 @@ afterTrailingSymlink:
 	}
 	// Reject attempts to open directories with O_CREAT.
 	if mayCreate && rp.MustBeDir() {
-		return nil, syserror.EISDIR
+		return nil, linuxerr.EISDIR
 	}
 	if err := fs.revalidateOne(ctx, rp.VirtualFilesystem(), parent, rp.Component(), &ds); err != nil {
 		return nil, err
@@ -938,11 +937,11 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	case linux.S_IFDIR:
 		// Can't open directories with O_CREAT.
 		if opts.Flags&linux.O_CREAT != 0 {
-			return nil, syserror.EISDIR
+			return nil, linuxerr.EISDIR
 		}
 		// Can't open directories writably.
 		if ats&vfs.MayWrite != 0 {
-			return nil, syserror.EISDIR
+			return nil, linuxerr.EISDIR
 		}
 		if opts.Flags&linux.O_DIRECT != 0 {
 			return nil, linuxerr.EINVAL
@@ -1070,7 +1069,7 @@ func (d *dentry) createAndOpenChildLocked(ctx context.Context, rp *vfs.Resolving
 		return nil, err
 	}
 	if d.isDeleted() {
-		return nil, syserror.ENOENT
+		return nil, linuxerr.ENOENT
 	}
 	mnt := rp.Mount()
 	if err := mnt.CheckBeginWrite(); err != nil {
@@ -1284,7 +1283,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		defer newParent.dirMu.Unlock()
 	}
 	if newParent.isDeleted() {
-		return syserror.ENOENT
+		return linuxerr.ENOENT
 	}
 	replaced, err := fs.getChildLocked(ctx, newParent, newName, &ds)
 	if err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
@@ -1298,7 +1297,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		replacedVFSD = &replaced.vfsd
 		if replaced.isDir() {
 			if !renamed.isDir() {
-				return syserror.EISDIR
+				return linuxerr.EISDIR
 			}
 			if genericIsAncestorDentry(replaced, renamed) {
 				return linuxerr.ENOTEMPTY

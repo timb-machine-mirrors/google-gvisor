@@ -48,7 +48,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // Key represents a shm segment key. Analogous to a file name.
@@ -155,7 +154,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key Key, size ui
 	if len(r.shms) >= linux.SHMMNI {
 		// "All possible shared memory IDs have been taken (SHMMNI) ..."
 		//   - man shmget(2)
-		return nil, syserror.ENOSPC
+		return nil, linuxerr.ENOSPC
 	}
 
 	if !private {
@@ -193,7 +192,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key Key, size ui
 		if !create {
 			// "No segment exists for the given key, and IPC_CREAT was not
 			// specified." - man shmget(2)
-			return nil, syserror.ENOENT
+			return nil, linuxerr.ENOENT
 		}
 	}
 
@@ -208,7 +207,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key Key, size ui
 		// "... allocating a segment of the requested size would cause the
 		// system to exceed the system-wide limit on shared memory (SHMALL)."
 		//   - man shmget(2)
-		return nil, syserror.ENOSPC
+		return nil, linuxerr.ENOSPC
 	}
 
 	// Need to create a new segment.
@@ -275,7 +274,7 @@ func (r *Registry) newShm(ctx context.Context, pid int32, key Key, creator fs.Fi
 	}
 
 	log.Warningf("Shm ids exhuasted, they may be leaking")
-	return nil, syserror.ENOSPC
+	return nil, linuxerr.ENOSPC
 }
 
 // IPCInfo reports global parameters for sysv shared memory segments on this
@@ -548,7 +547,7 @@ func (s *Shm) ConfigureAttach(ctx context.Context, addr hostarch.Addr, opts Atta
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.pendingDestruction && s.ReadRefs() == 0 {
-		return memmap.MMapOpts{}, syserror.EIDRM
+		return memmap.MMapOpts{}, linuxerr.EIDRM
 	}
 
 	if !s.checkPermissions(ctx, fs.PermMask{

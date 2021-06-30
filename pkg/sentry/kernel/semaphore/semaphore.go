@@ -158,7 +158,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, key, nsems int32, mode linu
 
 		if !create {
 			// Semaphore not found and should not be created.
-			return nil, syserror.ENOENT
+			return nil, linuxerr.ENOENT
 		}
 	}
 
@@ -172,10 +172,10 @@ func (r *Registry) FindOrCreate(ctx context.Context, key, nsems int32, mode linu
 	// Map semaphores and map indexes in a registry are of the same size,
 	// check map semaphores only here for the system limit.
 	if len(r.semaphores) >= setsMax {
-		return nil, syserror.ENOSPC
+		return nil, linuxerr.ENOSPC
 	}
 	if r.totalSems() > int(semsTotalMax-nsems) {
-		return nil, syserror.ENOSPC
+		return nil, linuxerr.ENOSPC
 	}
 
 	// Finally create a new set.
@@ -294,7 +294,7 @@ func (r *Registry) newSet(ctx context.Context, key int32, owner, creator fs.File
 	}
 
 	log.Warningf("Semaphore map is full, they must be leaking")
-	return nil, syserror.ENOMEM
+	return nil, linuxerr.ENOMEM
 }
 
 // FindByID looks up a set given an ID.
@@ -575,7 +575,7 @@ func (s *Set) ExecuteOps(ctx context.Context, ops []linux.Sembuf, creds *auth.Cr
 
 	// Did it race with a removal operation?
 	if s.dead {
-		return nil, 0, syserror.EIDRM
+		return nil, 0, linuxerr.EIDRM
 	}
 
 	// Validate the operations.
