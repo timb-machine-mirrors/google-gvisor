@@ -213,3 +213,23 @@ func BlockingRecvMMsg(fd int, msgHdrs []MMsgHdr) (int, tcpip.Error) {
 		}
 	}
 }
+
+// NonBlockingReadv reads from a file descriptor that is set up as non-blocking and
+// stores the data in a list of iovecs buffers.
+func NonBlockingReadv(fd int, iovecs []unix.Iovec) (int, tcpip.Error) {
+	n, _, e := unix.RawSyscall(unix.SYS_READV, uintptr(fd), uintptr(unsafe.Pointer(&iovecs[0])), uintptr(len(iovecs)))
+	if e == 0 {
+		return int(n), nil
+	}
+	return 0, TranslateErrno(e)
+}
+
+// NonBlockingRecvMMsg reads from a file descriptor that is set up as non-blocking
+// and stores the received messages in a slice of MMsgHdr structures.
+func NonBlockingRecvMMsg(fd int, msgHdrs []MMsgHdr) (int, tcpip.Error) {
+	n, _, e := unix.RawSyscall6(unix.SYS_RECVMMSG, uintptr(fd), uintptr(unsafe.Pointer(&msgHdrs[0])), uintptr(len(msgHdrs)), unix.MSG_DONTWAIT, 0, 0)
+	if e == 0 {
+		return int(n), nil
+	}
+	return 0, TranslateErrno(e)
+}

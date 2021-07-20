@@ -50,6 +50,12 @@ func (s *TestStack) Interfaces() map[int32]Interface {
 	return s.InterfacesMap
 }
 
+// RemoveInterface implements Stack.RemoveInterface.
+func (s *TestStack) RemoveInterface(idx int32) error {
+	delete(s.InterfacesMap, idx)
+	return nil
+}
+
 // InterfaceAddrs implements Stack.InterfaceAddrs.
 func (s *TestStack) InterfaceAddrs() map[int32][]InterfaceAddr {
 	return s.InterfaceAddrsMap

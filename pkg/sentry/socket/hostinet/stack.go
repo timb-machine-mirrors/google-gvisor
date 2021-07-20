@@ -309,6 +309,11 @@ func (s *Stack) Interfaces() map[int32]inet.Interface {
 	return interfaces
 }
 
+// RemoveInterface implements inet.Stack.RemoveInterface.
+func (s *Stack) RemoveInterface(idx int32) error {
+	return linuxerr.EACCES
+}
+
 // InterfaceAddrs implements inet.Stack.InterfaceAddrs.
 func (s *Stack) InterfaceAddrs() map[int32][]inet.InterfaceAddr {
 	addrs := make(map[int32][]inet.InterfaceAddr)
