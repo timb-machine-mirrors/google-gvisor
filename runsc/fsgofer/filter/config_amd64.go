@@ -19,48 +19,25 @@ package filter
 
 import (
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/seccomp"
 )
 
 func init() {
-	allowedSyscalls[unix.SYS_ARCH_PRCTL] = []seccomp.Rule{
-		// TODO(b/168828518): No longer used in Go 1.16+.
-		{seccomp.EqualTo(linux.ARCH_SET_FS)},
-	}
-
-	allowedSyscalls[unix.SYS_CLONE] = []seccomp.Rule{
+	allowedSyscalls.Set(unix.SYS_CLONE, seccomp.PerArg{
 		// parent_tidptr and child_tidptr are always 0 because neither
 		// CLONE_PARENT_SETTID nor CLONE_CHILD_SETTID are used.
-		{
-			seccomp.EqualTo(
-				unix.CLONE_VM |
-					unix.CLONE_FS |
-					unix.CLONE_FILES |
-					unix.CLONE_SETTLS |
-					unix.CLONE_SIGHAND |
-					unix.CLONE_SYSVSEM |
-					unix.CLONE_THREAD),
-			seccomp.MatchAny{}, // newsp
-			seccomp.EqualTo(0), // parent_tidptr
-			seccomp.EqualTo(0), // child_tidptr
-			seccomp.MatchAny{}, // tls
-		},
-		{
-			// TODO(b/168828518): No longer used in Go 1.16+ (on amd64).
-			seccomp.EqualTo(
-				unix.CLONE_VM |
-					unix.CLONE_FS |
-					unix.CLONE_FILES |
-					unix.CLONE_SIGHAND |
-					unix.CLONE_SYSVSEM |
-					unix.CLONE_THREAD),
-			seccomp.MatchAny{}, // newsp
-			seccomp.EqualTo(0), // parent_tidptr
-			seccomp.EqualTo(0), // child_tidptr
-			seccomp.MatchAny{}, // tls
-		},
-	}
-
-	allowedSyscalls[unix.SYS_NEWFSTATAT] = []seccomp.Rule{}
+		seccomp.EqualTo(
+			unix.CLONE_VM |
+				unix.CLONE_FS |
+				unix.CLONE_FILES |
+				unix.CLONE_SETTLS |
+				unix.CLONE_SIGHAND |
+				unix.CLONE_SYSVSEM |
+				unix.CLONE_THREAD),
+		seccomp.AnyValue{}, // newsp
+		seccomp.EqualTo(0), // parent_tidptr
+		seccomp.EqualTo(0), // child_tidptr
+		seccomp.AnyValue{}, // tls
+	})
+	allowedSyscalls.Set(unix.SYS_NEWFSTATAT, seccomp.MatchAll{})
 }

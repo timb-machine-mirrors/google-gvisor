@@ -20,15 +20,14 @@ package kvm
 import (
 	"fmt"
 	"reflect"
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
-	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 )
@@ -42,7 +41,7 @@ var vcpuInit kvmVcpuInit
 
 // initArchState initializes architecture-specific state.
 func (m *machine) initArchState() error {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(m.fd),
 		_KVM_ARM_PREFERRED_TARGET,
@@ -54,12 +53,9 @@ func (m *machine) initArchState() error {
 	// The reason for the difference is that ARM64 and x86_64 have different KVM timer mechanisms.
 	// If we create vCPU dynamically on ARM64, the timer for vCPU would mess up for a short time.
 	// For more detail, please refer to https://github.com/google/gvisor/issues/5739
-	m.initialvCPUs = make(map[int]*vCPU)
 	m.mu.Lock()
-	for int(m.nextID) < m.maxVCPUs-1 {
-		c := m.newVCPU()
-		c.state = 0
-		m.initialvCPUs[c.id] = c
+	for i := 0; i < m.maxVCPUs; i++ {
+		m.createVCPU(i)
 	}
 	m.mu.Unlock()
 	return nil
@@ -78,7 +74,7 @@ func (c *vCPU) initArchState() error {
 	regGet.addr = uint64(reflect.ValueOf(&dataGet).Pointer())
 
 	vcpuInit.features[0] |= (1 << _KVM_ARM_VCPU_PSCI_0_2)
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_ARM_VCPU_INIT,
@@ -118,6 +114,34 @@ func (c *vCPU) initArchState() error {
 		return err
 	}
 
+	// cntkctl_el1
+	data = _CNTKCTL_EL1_DEFAULT
+	reg.id = _KVM_ARM64_REGS_CNTKCTL_EL1
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
+	// cpacr_el1
+	data = 0
+	reg.id = _KVM_ARM64_REGS_CPACR_EL1
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
+	// sctlr_el1
+	data = _SCTLR_EL1_DEFAULT
+	reg.id = _KVM_ARM64_REGS_SCTLR_EL1
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
+	// tpidr_el1
+	reg.id = _KVM_ARM64_REGS_TPIDR_EL1
+	data = uint64(reflect.ValueOf(&c.CPU).Pointer() | ring0.KernelStartAddress)
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
 	// sp_el1
 	data = c.CPU.StackTop()
 	reg.id = _KVM_ARM64_REGS_SP_EL1
@@ -127,21 +151,14 @@ func (c *vCPU) initArchState() error {
 
 	// pc
 	reg.id = _KVM_ARM64_REGS_PC
-	data = uint64(reflect.ValueOf(ring0.Start).Pointer())
-	if err := c.setOneRegister(&reg); err != nil {
-		return err
-	}
-
-	// r8
-	reg.id = _KVM_ARM64_REGS_R8
-	data = uint64(reflect.ValueOf(&c.CPU).Pointer())
+	data = uint64(ring0.AddrOfStart())
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
 	}
 
 	// vbar_el1
 	reg.id = _KVM_ARM64_REGS_VBAR_EL1
-	vectorLocation := reflect.ValueOf(ring0.Vectors).Pointer()
+	vectorLocation := ring0.AddrOfVectors()
 	data = uint64(ring0.KernelStartAddress | vectorLocation)
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
@@ -149,7 +166,8 @@ func (c *vCPU) initArchState() error {
 
 	// Use the address of the exception vector table as
 	// the MMIO address base.
-	arm64HypercallMMIOBase = vectorLocation
+	vectorLocationPhys, _, _ := translateToPhysical(vectorLocation)
+	arm64HypercallMMIOBase = vectorLocationPhys
 
 	// Initialize the PCID database.
 	if hasGuestPCID {
@@ -158,8 +176,6 @@ func (c *vCPU) initArchState() error {
 		// practice, this should not happen, however.
 		c.PCIDs = pagetables.NewPCIDs(fixedKernelPCID+1, poolPCIDs)
 	}
-
-	c.floatingPointState = fpu.NewState()
 
 	return c.setSystemTime()
 }
@@ -240,11 +256,11 @@ func (c *vCPU) setSystemTime() error {
 func (c *vCPU) loadSegments(tid uint64) {
 	// TODO(gvisor.dev/issue/1238):  TLS is not supported.
 	// Get TLS from tpidr_el0.
-	atomic.StoreUint64(&c.tid, tid)
+	c.tid.Store(tid)
 }
 
 func (c *vCPU) setOneRegister(reg *kvmOneReg) error {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_SET_ONE_REG,
@@ -255,7 +271,7 @@ func (c *vCPU) setOneRegister(reg *kvmOneReg) error {
 }
 
 func (c *vCPU) getOneRegister(reg *kvmOneReg) error {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_GET_ONE_REG,
@@ -332,4 +348,16 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 		panic(fmt.Sprintf("unexpected vector: 0x%x", vector))
 	}
 
+}
+
+//go:nosplit
+func seccompMmapSyscall(context unsafe.Pointer) (uintptr, uintptr, unix.Errno) {
+	ctx := bluepillArchContext(context)
+
+	// MAP_DENYWRITE is deprecated and ignored by kernel. We use it only for seccomp filters.
+	addr, e := hostsyscall.RawSyscall6(uintptr(ctx.Regs[8]), uintptr(ctx.Regs[0]), uintptr(ctx.Regs[1]),
+		uintptr(ctx.Regs[2]), uintptr(ctx.Regs[3])|unix.MAP_DENYWRITE, uintptr(ctx.Regs[4]), uintptr(ctx.Regs[5]))
+	ctx.Regs[0] = uint64(addr)
+
+	return addr, uintptr(ctx.Regs[1]), unix.Errno(e)
 }

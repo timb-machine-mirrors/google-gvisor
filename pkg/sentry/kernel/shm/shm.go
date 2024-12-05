@@ -16,24 +16,25 @@
 //
 // Known missing features:
 //
-// - SHM_LOCK/SHM_UNLOCK are no-ops. The sentry currently doesn't implement
-//   memory locking in general.
+//   - SHM_LOCK/SHM_UNLOCK are no-ops. The sentry currently doesn't implement
+//     memory locking in general.
 //
-// - SHM_HUGETLB and related flags for shmget(2) are ignored. There's no easy
-//   way to implement hugetlb support on a per-map basis, and it has no impact
-//   on correctness.
+//   - SHM_HUGETLB and related flags for shmget(2) are ignored. There's no easy
+//     way to implement hugetlb support on a per-map basis, and it has no impact
+//     on correctness.
 //
-// - SHM_NORESERVE for shmget(2) is ignored, the sentry doesn't implement swap
-//   so it's meaningless to reserve space for swap.
+//   - SHM_NORESERVE for shmget(2) is ignored, the sentry doesn't implement swap
+//     so it's meaningless to reserve space for swap.
 //
-// - No per-process segment size enforcement. This feature probably isn't used
-//   much anyways, since Linux sets the per-process limits to the system-wide
-//   limits by default.
+//   - No per-process segment size enforcement. This feature probably isn't used
+//     much anyways, since Linux sets the per-process limits to the system-wide
+//     limits by default.
 //
 // Lock ordering: mm.mappingMu -> shm registry lock -> shm lock
 package shm
 
 import (
+	goContext "context"
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -41,15 +42,14 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // Registry tracks all shared memory segments in an IPC namespace. The registry
@@ -66,7 +66,7 @@ type Registry struct {
 
 	// reg defines basic fields and operations needed for all SysV registries.
 	//
-	// Withing reg, there are two maps, Objects and KeysToIDs.
+	// Within reg, there are two maps, Objects and KeysToIDs.
 	//
 	// reg.objects holds all referenced segments, which are removed on the last
 	// DecRef. Thus, it cannot itself hold a reference on the Shm.
@@ -151,7 +151,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, siz
 	if r.reg.ObjectCount() >= linux.SHMMNI {
 		// "All possible shared memory IDs have been taken (SHMMNI) ..."
 		//   - man shmget(2)
-		return nil, syserror.ENOSPC
+		return nil, linuxerr.ENOSPC
 	}
 
 	if !private {
@@ -184,11 +184,11 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, siz
 		// "... allocating a segment of the requested size would cause the
 		// system to exceed the system-wide limit on shared memory (SHMALL)."
 		//   - man shmget(2)
-		return nil, syserror.ENOSPC
+		return nil, linuxerr.ENOSPC
 	}
 
 	// Need to create a new segment.
-	s, err := r.newShmLocked(ctx, pid, key, fs.FileOwnerFromContext(ctx), fs.FilePermsFromMode(mode), size)
+	s, err := r.newShmLocked(ctx, pid, key, auth.CredentialsFromContext(ctx), mode, size)
 	if err != nil {
 		return nil, err
 	}
@@ -201,24 +201,29 @@ func (r *Registry) FindOrCreate(ctx context.Context, pid int32, key ipc.Key, siz
 // newShmLocked creates a new segment in the registry.
 //
 // Precondition: Caller must hold r.mu.
-func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, creator fs.FileOwner, perms fs.FilePermissions, size uint64) (*Shm, error) {
-	mfp := pgalloc.MemoryFileProviderFromContext(ctx)
-	if mfp == nil {
-		panic(fmt.Sprintf("context.Context %T lacks non-nil value for key %T", ctx, pgalloc.CtxMemoryFileProvider))
+func (r *Registry) newShmLocked(ctx context.Context, pid int32, key ipc.Key, creator *auth.Credentials, mode linux.FileMode, size uint64) (*Shm, error) {
+	mf := pgalloc.MemoryFileFromContext(ctx)
+	if mf == nil {
+		panic(fmt.Sprintf("context.Context %T lacks non-nil value for key %T", ctx, pgalloc.CtxMemoryFile))
+	}
+	devID, ok := deviceIDFromContext(ctx)
+	if !ok {
+		panic(fmt.Sprintf("context.Context %T lacks value for key %T", ctx, CtxDeviceID))
 	}
 
 	effectiveSize := uint64(hostarch.Addr(size).MustRoundUp())
-	fr, err := mfp.MemoryFile().Allocate(effectiveSize, usage.Anonymous)
+	fr, err := mf.Allocate(effectiveSize, pgalloc.AllocOpts{Kind: usage.Anonymous, MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx)})
 	if err != nil {
 		return nil, err
 	}
 
 	shm := &Shm{
-		mfp:           mfp,
+		mf:            mf,
 		registry:      r,
+		devID:         devID,
 		size:          size,
 		effectiveSize: effectiveSize,
-		obj:           ipc.NewObject(r.reg.UserNS, ipc.Key(key), creator, creator, perms),
+		obj:           ipc.NewObject(r.reg.UserNS, ipc.Key(key), creator, creator, mode),
 		fr:            fr,
 		creatorPID:    pid,
 		changeTime:    ktime.NowFromContext(ctx),
@@ -327,10 +332,13 @@ type Shm struct {
 	// via MappingIdentity.
 	ShmRefs
 
-	mfp pgalloc.MemoryFileProvider
+	mf *pgalloc.MemoryFile `state:"nosave"`
 
 	// registry points to the shm registry containing this segment. Immutable.
 	registry *Registry
+
+	// devID is the segment's device ID. Immutable.
+	devID uint32
 
 	// size is the requested size of the segment at creation, in
 	// bytes. Immutable.
@@ -370,6 +378,11 @@ type Shm struct {
 	// in the registry and can no longer be attached. When the last user
 	// detaches from the segment, it is destroyed.
 	pendingDestruction bool
+}
+
+// afterLoad is invoked by stateify.
+func (s *Shm) afterLoad(ctx goContext.Context) {
+	s.mf = pgalloc.MemoryFileFromContext(ctx)
 }
 
 // ID returns object's ID.
@@ -414,7 +427,7 @@ func (s *Shm) MappedName(ctx context.Context) string {
 
 // DeviceID implements memmap.MappingIdentity.DeviceID.
 func (s *Shm) DeviceID() uint64 {
-	return shmDevice.DeviceID()
+	return uint64(s.devID)
 }
 
 // InodeID implements memmap.MappingIdentity.InodeID.
@@ -429,7 +442,7 @@ func (s *Shm) InodeID() uint64 {
 // Precondition: Caller must not hold s.mu.
 func (s *Shm) DecRef(ctx context.Context) {
 	s.ShmRefs.DecRef(func() {
-		s.mfp.MemoryFile().DecRef(s.fr)
+		s.mf.DecRef(s.fr)
 		s.registry.remove(s)
 	})
 }
@@ -445,7 +458,7 @@ func (s *Shm) AddMapping(ctx context.Context, _ memmap.MappingSpace, _ hostarch.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attachTime = ktime.NowFromContext(ctx)
-	if pid, ok := context.ThreadGroupIDFromContext(ctx); ok {
+	if pid, ok := auth.ThreadGroupIDFromContext(ctx); ok {
 		s.lastAttachDetachPID = pid
 	} else {
 		// AddMapping is called during a syscall, so ctx should always be a task
@@ -469,7 +482,7 @@ func (s *Shm) RemoveMapping(ctx context.Context, _ memmap.MappingSpace, _ hostar
 
 	// If called from a non-task context we also won't have a threadgroup
 	// id. Silently skip updating the lastAttachDetachPid in that case.
-	if pid, ok := context.ThreadGroupIDFromContext(ctx); ok {
+	if pid, ok := auth.ThreadGroupIDFromContext(ctx); ok {
 		s.lastAttachDetachPID = pid
 	} else {
 		log.Debugf("Couldn't obtain pid when removing mapping to %s, not updating the last detach pid.", s.debugLocked())
@@ -491,7 +504,7 @@ func (s *Shm) Translate(ctx context.Context, required, optional memmap.MappableR
 		return []memmap.Translation{
 			{
 				Source: source,
-				File:   s.mfp.MemoryFile(),
+				File:   s.mf,
 				Offset: s.fr.Start + source.Start,
 				Perms:  hostarch.AnyAccess,
 			},
@@ -521,15 +534,18 @@ func (s *Shm) ConfigureAttach(ctx context.Context, addr hostarch.Addr, opts Atta
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.pendingDestruction && s.ReadRefs() == 0 {
-		return memmap.MMapOpts{}, syserror.EIDRM
+		return memmap.MMapOpts{}, linuxerr.EIDRM
 	}
 
 	creds := auth.CredentialsFromContext(ctx)
-	if !s.obj.CheckPermissions(creds, fs.PermMask{
-		Read:    true,
-		Write:   !opts.Readonly,
-		Execute: opts.Execute,
-	}) {
+	ats := vfs.MayRead
+	if !opts.Readonly {
+		ats |= vfs.MayWrite
+	}
+	if opts.Execute {
+		ats |= vfs.MayExec
+	}
+	if !s.obj.CheckPermissions(creds, ats) {
 		// "The calling process does not have the required permissions for the
 		// requested attach type, and does not have the CAP_IPC_OWNER capability
 		// in the user namespace that governs its IPC namespace." - man shmat(2)
@@ -566,7 +582,7 @@ func (s *Shm) IPCStat(ctx context.Context) (*linux.ShmidDS, error) {
 	// "The caller must have read permission on the shared memory segment."
 	//   - man shmctl(2)
 	creds := auth.CredentialsFromContext(ctx)
-	if !s.obj.CheckPermissions(creds, fs.PermMask{Read: true}) {
+	if !s.obj.CheckPermissions(creds, vfs.MayRead) {
 		// "IPC_STAT or SHM_STAT is requested and shm_perm.mode does not allow
 		// read access for shmid, and the calling process does not have the
 		// CAP_IPC_OWNER capability in the user namespace that governs its IPC
@@ -595,11 +611,11 @@ func (s *Shm) IPCStat(ctx context.Context) (*linux.ShmidDS, error) {
 	ds := &linux.ShmidDS{
 		ShmPerm: linux.IPCPerm{
 			Key:  uint32(s.obj.Key),
-			UID:  uint32(creds.UserNamespace.MapFromKUID(s.obj.Owner.UID)),
-			GID:  uint32(creds.UserNamespace.MapFromKGID(s.obj.Owner.GID)),
-			CUID: uint32(creds.UserNamespace.MapFromKUID(s.obj.Creator.UID)),
-			CGID: uint32(creds.UserNamespace.MapFromKGID(s.obj.Creator.GID)),
-			Mode: mode | uint16(s.obj.Perms.LinuxMode()),
+			UID:  uint32(creds.UserNamespace.MapFromKUID(s.obj.OwnerUID)),
+			GID:  uint32(creds.UserNamespace.MapFromKGID(s.obj.OwnerGID)),
+			CUID: uint32(creds.UserNamespace.MapFromKUID(s.obj.CreatorUID)),
+			CGID: uint32(creds.UserNamespace.MapFromKGID(s.obj.CreatorGID)),
+			Mode: mode | uint16(s.obj.Mode),
 			Seq:  0, // IPC sequences not supported.
 		},
 		ShmSegsz:   s.size,
@@ -619,24 +635,9 @@ func (s *Shm) Set(ctx context.Context, ds *linux.ShmidDS) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	creds := auth.CredentialsFromContext(ctx)
-	if !s.obj.CheckOwnership(creds) {
-		return linuxerr.EPERM
+	if err := s.obj.Set(ctx, &ds.ShmPerm); err != nil {
+		return err
 	}
-
-	uid := creds.UserNamespace.MapToKUID(auth.UID(ds.ShmPerm.UID))
-	gid := creds.UserNamespace.MapToKGID(auth.GID(ds.ShmPerm.GID))
-	if !uid.Ok() || !gid.Ok() {
-		return linuxerr.EINVAL
-	}
-
-	// User may only modify the lower 9 bits of the mode. All the other bits are
-	// always 0 for the underlying inode.
-	mode := linux.FileMode(ds.ShmPerm.Mode & 0x1ff)
-	s.obj.Perms = fs.FilePermsFromMode(mode)
-
-	s.obj.Owner.UID = uid
-	s.obj.Owner.GID = gid
 
 	s.changeTime = ktime.NowFromContext(ctx)
 	return nil

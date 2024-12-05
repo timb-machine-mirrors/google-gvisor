@@ -15,16 +15,11 @@
 package kvm
 
 import (
-	"fmt"
-
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/ring0"
-	"gvisor.dev/gvisor/pkg/safecopy"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
-
-// bluepill enters guest mode.
-func bluepill(*vCPU)
 
 // sighandler is the signal entry point.
 func sighandler()
@@ -61,15 +56,22 @@ var (
 	// This is called by bluepillHandler.
 	savedHandler uintptr
 
+	// savedSigsysHandler is a pointer to the previous handler of the SIGSYS signals.
+	savedSigsysHandler uintptr
+
 	// dieTrampolineAddr is the address of dieTrampoline.
 	dieTrampolineAddr uintptr
 )
+
+// _SYS_KVM_RETURN_TO_HOST is the system call that is used to transition
+// to host.
+const _SYS_KVM_RETURN_TO_HOST = ^uintptr(0)
 
 // redpill invokes a syscall with -1.
 //
 //go:nosplit
 func redpill() {
-	unix.RawSyscall(^uintptr(0), 0, 0, 0)
+	hostsyscall.RawSyscallErrno(_SYS_KVM_RETURN_TO_HOST, 0, 0, 0)
 }
 
 // dieHandler is called by dieTrampoline.
@@ -93,11 +95,6 @@ func (c *vCPU) die(context *arch.SignalContext64, msg string) {
 }
 
 func init() {
-	// Install the handler.
-	if err := safecopy.ReplaceSignalHandler(bluepillSignal, addrOfSighandler(), &savedHandler); err != nil {
-		panic(fmt.Sprintf("Unable to set handler for signal %d: %v", bluepillSignal, err))
-	}
-
 	// Extract the address for the trampoline.
 	dieTrampolineAddr = addrOfDieTrampoline()
 }

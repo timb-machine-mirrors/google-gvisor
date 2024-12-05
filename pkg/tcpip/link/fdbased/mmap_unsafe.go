@@ -19,10 +19,11 @@ package fdbased
 
 import (
 	"fmt"
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/tcpip/link/stopfd"
 )
 
 // tPacketHdrlen is the TPACKET_HDRLEN variable defined in <linux/if_packet.h>.
@@ -34,7 +35,7 @@ var tPacketHdrlen = tPacketAlign(unsafe.Sizeof(tPacketHdr{}) + unsafe.Sizeof(uni
 func (t tPacketHdr) tpStatus() uint32 {
 	hdr := unsafe.Pointer(&t[0])
 	statusPtr := unsafe.Pointer(uintptr(hdr) + uintptr(tpStatusOffset))
-	return atomic.LoadUint32((*uint32)(statusPtr))
+	return (*atomicbitops.Uint32)(statusPtr).Load()
 }
 
 // setTPStatus set's the frame status to the provided status.
@@ -43,13 +44,18 @@ func (t tPacketHdr) tpStatus() uint32 {
 func (t tPacketHdr) setTPStatus(status uint32) {
 	hdr := unsafe.Pointer(&t[0])
 	statusPtr := unsafe.Pointer(uintptr(hdr) + uintptr(tpStatusOffset))
-	atomic.StoreUint32((*uint32)(statusPtr), status)
+	(*atomicbitops.Uint32)(statusPtr).Store(status)
 }
 
-func newPacketMMapDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
+func newPacketMMapDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, error) {
+	stopFD, err := stopfd.New()
+	if err != nil {
+		return nil, err
+	}
 	d := &packetMMapDispatcher{
-		fd: fd,
-		e:  e,
+		StopFD: stopFD,
+		fd:     fd,
+		e:      e,
 	}
 	pageSize := unix.Getpagesize()
 	if tpBlockSize%pageSize != 0 {
@@ -71,6 +77,8 @@ func newPacketMMapDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unix.Mmap(...,0, %v, ...) failed = %v", sz, err)
 	}
+	d.mgr = newProcessorManager(opts, e)
+	d.mgr.start()
 	d.ringBuffer = buf
 	return d, nil
 }

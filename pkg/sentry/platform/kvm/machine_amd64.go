@@ -21,15 +21,16 @@ import (
 	"fmt"
 	"math/big"
 	"reflect"
+	"runtime"
 	"runtime/debug"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
-	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 )
@@ -38,14 +39,23 @@ import (
 func (m *machine) initArchState() error {
 	// Set the legacy TSS address. This address is covered by the reserved
 	// range (up to 4GB). In fact, this is a main reason it exists.
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(m.fd),
-		_KVM_SET_TSS_ADDR,
+		KVM_SET_TSS_ADDR,
 		uintptr(reservedMemory-(3*hostarch.PageSize))); errno != 0 {
 		return errno
 	}
 
+	// Initialize all vCPUs to minimize kvm ioctl-s allowed by seccomp filters.
+	m.mu.Lock()
+	for i := 0; i < m.maxVCPUs; i++ {
+		m.createVCPU(i)
+	}
+	m.mu.Unlock()
+
+	c := m.Get()
+	defer m.Put(c)
 	// Enable CPUID faulting, if possible. Note that this also serves as a
 	// basic platform sanity tests, since we will enter guest mode for the
 	// first time here. The recovery is necessary, since if we fail to read
@@ -56,15 +66,11 @@ func (m *machine) initArchState() error {
 		recover()
 		debug.SetPanicOnFault(old)
 	}()
-	c := m.Get()
-	defer m.Put(c)
+
 	bluepill(c)
 	ring0.SetCPUIDFaulting(true)
 
 	return nil
-}
-
-type machineArchState struct {
 }
 
 type vCPUArchState struct {
@@ -73,9 +79,8 @@ type vCPUArchState struct {
 	// This starts above fixedKernelPCID.
 	PCIDs *pagetables.PCIDs
 
-	// floatingPointState is the floating point state buffer used in guest
-	// to host transitions. See usage in bluepill_amd64.go.
-	floatingPointState fpu.State
+	// signalStack is the signal stack of the last thread bound to this vCPU.
+	signalStack linux.SignalStack
 }
 
 const (
@@ -152,23 +157,22 @@ func (c *vCPU) initArchState() error {
 		return fmt.Errorf("error setting user registers: %v", errno)
 	}
 
-	// Allocate some floating point state save area for the local vCPU.
-	// This will be saved prior to leaving the guest, and we restore from
-	// this always. We cannot use the pointer in the context alone because
-	// we don't know how large the area there is in reality.
-	c.floatingPointState = fpu.NewState()
-
 	// Set the time offset to the host native time.
 	return c.setSystemTime()
 }
 
 // bitsForScaling returns the bits available for storing the fraction component
+// of the TSC scaling ratio.
+// It is set using getBitsForScaling when the KVM platform is initialized.
+var bitsForScaling int64
+
+// getBitsForScaling returns the bits available for storing the fraction component
 // of the TSC scaling ratio. This allows us to replicate the (bad) math done by
 // the kernel below in scaledTSC, and ensure we can compute an exact zero
 // offset in setSystemTime.
 //
 // These constants correspond to kvm_tsc_scaling_ratio_frac_bits.
-var bitsForScaling = func() int64 {
+func getBitsForScaling() int64 {
 	fs := cpuid.HostFeatureSet()
 	if fs.Intel() {
 		return 48 // See vmx.c (kvm sources).
@@ -177,7 +181,7 @@ var bitsForScaling = func() int64 {
 	} else {
 		return 63 // Unknown: theoretical maximum.
 	}
-}()
+}
 
 // scaledTSC returns the host TSC scaled by the given frequency.
 //
@@ -193,7 +197,7 @@ var bitsForScaling = func() int64 {
 // strict inverse of this value. This simplifies this function considerably.
 //
 // Roughly, the returned value "scaledTSC" will have:
-// 	scaledTSC/hostTSC == 1/rawFreq
+// scaledTSC/hostTSC == 1/rawFreq
 //
 //go:nosplit
 func scaledTSC(rawFreq uintptr) int64 {
@@ -206,6 +210,17 @@ func scaledTSC(rawFreq uintptr) int64 {
 
 // setSystemTime sets the vCPU to the system time.
 func (c *vCPU) setSystemTime() error {
+	// Attempt to set the offset directly. This is supported as of Linux 5.16,
+	// or commit 828ca89628bfcb1b8f27535025f69dd00eb55207.
+	if err := c.setTSCOffset(); err == nil {
+		return err
+	}
+
+	// If tsc scaling is not supported, fallback to legacy mode.
+	if !c.machine.tscControl {
+		return c.setSystemTimeLegacy()
+	}
+
 	// First, scale down the clock frequency to the lowest value allowed by
 	// the API itself.  How low we can go depends on the underlying
 	// hardware, but it is typically ~1/2^48 for Intel, ~1/2^32 for AMD.
@@ -217,11 +232,6 @@ func (c *vCPU) setSystemTime() error {
 	// capabilities as it is emulated in KVM. We don't actually use this
 	// capability, but it means that this method should be robust to
 	// different hardware configurations.
-
-	// if tsc scaling is not supported, fallback to legacy mode
-	if !c.machine.tscControl {
-		return c.setSystemTimeLegacy()
-	}
 	rawFreq, err := c.getTSCFreq()
 	if err != nil {
 		return c.setSystemTimeLegacy()
@@ -290,10 +300,13 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 	// Reset the pointed SignalInfo.
 	*info = linux.SignalInfo{Signo: signal}
 	info.SetAddr(uint64(faultAddr))
-	accessType := hostarch.AccessType{
-		Read:    code&(1<<1) == 0,
-		Write:   code&(1<<1) != 0,
-		Execute: code&(1<<4) != 0,
+	accessType := hostarch.AccessType{}
+	if signal == int32(unix.SIGSEGV) {
+		accessType = hostarch.AccessType{
+			Read:    code&(1<<1) == 0,
+			Write:   code&(1<<1) != 0,
+			Execute: code&(1<<4) != 0,
+		}
 	}
 	if !accessType.Write && !accessType.Execute {
 		info.Code = 1 // SEGV_MAPERR.
@@ -307,22 +320,6 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 //go:noinline
 func loadByte(ptr *byte) byte {
 	return *ptr
-}
-
-// prefaultFloatingPointState touches each page of the floating point state to
-// be sure that its physical pages are mapped.
-//
-// Otherwise the kernel can trigger KVM_EXIT_MMIO and an instruction that
-// triggered a fault will be emulated by the kvm kernel code, but it can't
-// emulate instructions like xsave and xrstor.
-//
-//go:nosplit
-func prefaultFloatingPointState(data *fpu.State) {
-	size := len(*data)
-	for i := 0; i < size; i += hostarch.PageSize {
-		loadByte(&(*data)[i])
-	}
-	loadByte(&(*data)[size-1])
 }
 
 // SwitchToUser unpacks architectural-details.
@@ -355,11 +352,6 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 	// allocations occur.
 	entersyscall()
 	bluepill(c)
-	// The root table physical page has to be mapped to not fault in iret
-	// or sysret after switching into a user address space.  sysret and
-	// iret are in the upper half that is global and already mapped.
-	switchOpts.PageTables.PrefaultRootTable()
-	prefaultFloatingPointState(switchOpts.FloatingPointState)
 	vector = c.CPU.SwitchToUser(switchOpts)
 	exitsyscall()
 
@@ -393,7 +385,7 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 			// When CPUID faulting is enabled, we will generate a #GP(0) when
 			// userspace executes a CPUID instruction. This is handled above,
 			// because we need to be able to map and read user memory.
-			return hostarch.AccessType{}, platform.ErrContextSignalCPUID
+			return hostarch.AccessType{}, tryCPUIDError{}
 		}
 		return hostarch.AccessType{}, platform.ErrContextSignal
 
@@ -459,20 +451,10 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *linux.SignalInfo)
 	}
 }
 
-// On x86 platform, the flags for "setMemoryRegion" can always be set as 0.
-// There is no need to return read-only physicalRegions.
-func rdonlyRegionsForSetMem() (phyRegions []physicalRegion) {
-	return nil
-}
-
-func availableRegionsForSetMem() (phyRegions []physicalRegion) {
-	return physicalRegions
-}
-
 func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 	// Map all the executable regions so that all the entry functions
 	// are mapped in the upper half.
-	applyVirtualRegions(func(vr virtualRegion) {
+	if err := applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) || vr.filename == "[vsyscall]" {
 			return
 		}
@@ -489,7 +471,9 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 				pagetables.MapOpts{AccessType: hostarch.Execute, Global: true},
 				physical)
 		}
-	})
+	}); err != nil {
+		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
+	}
 	for start, end := range m.kernel.EntryRegions() {
 		regionLen := end - start
 		physical, length, ok := translateToPhysical(start)
@@ -506,19 +490,24 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 
 // getMaxVCPU get max vCPU number
 func (m *machine) getMaxVCPU() {
-	maxVCPUs, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
+	maxVCPUs, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
 	if errno != 0 {
 		m.maxVCPUs = _KVM_NR_VCPUS
 	} else {
 		m.maxVCPUs = int(maxVCPUs)
 	}
+
+	// The goal here is to avoid vCPU contentions for reasonable workloads.
+	// But "reasonable" isn't defined well in this case. Let's say that CPU
+	// overcommit with factor 2 is still acceptable. We allocate a set of
+	// vCPU for each goruntime processor (P) and two sets of vCPUs to run
+	// user code.
+	rCPUs := runtime.GOMAXPROCS(0)
+	if 3*rCPUs < m.maxVCPUs {
+		m.maxVCPUs = 3 * rCPUs
+	}
 }
 
-// getNewVCPU create a new vCPU (maybe)
-func (m *machine) getNewVCPU() *vCPU {
-	if int(m.nextID) < m.maxVCPUs {
-		c := m.newVCPU()
-		return c
-	}
-	return nil
+func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
+	return physicalRegions
 }

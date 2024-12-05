@@ -22,11 +22,9 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 var (
@@ -38,14 +36,14 @@ var (
 // us to pass a function which does not take any arguments, whereas Increment()
 // takes a variadic number of arguments.
 func incrementPartialResultMetric() {
-	metric.WeirdnessMetric.Increment("partial_result")
+	metric.WeirdnessMetric.Increment(&metric.WeirdnessTypePartialResult)
 }
 
-// HandleIOErrorVFS2 handles special error cases for partial results. For some
+// HandleIOError handles special error cases for partial results. For some
 // errors, we may consume the error and return only the partial read/write.
 //
 // op and f are used only for panics.
-func HandleIOErrorVFS2(ctx context.Context, partialResult bool, ioerr, intr error, op string, f *vfs.FileDescription) error {
+func HandleIOError(ctx context.Context, partialResult bool, ioerr, intr error, op string, f *vfs.FileDescription) error {
 	known, err := handleIOErrorImpl(ctx, partialResult, ioerr, intr, op)
 	if err != nil {
 		return err
@@ -64,24 +62,6 @@ func HandleIOErrorVFS2(ctx context.Context, partialResult bool, ioerr, intr erro
 // handleIOError handles special error cases for partial results. For some
 // errors, we may consume the error and return only the partial read/write.
 //
-// op and f are used only for panics.
-func handleIOError(ctx context.Context, partialResult bool, ioerr, intr error, op string, f *fs.File) error {
-	known, err := handleIOErrorImpl(ctx, partialResult, ioerr, intr, op)
-	if err != nil {
-		return err
-	}
-	if !known {
-		// An unknown error is encountered with a partial read/write.
-		name, _ := f.Dirent.FullName(nil /* ignore chroot */)
-		log.Traceback("Invalid request partialResult %v and err (type %T) %v for %s operation on %q, %T", partialResult, ioerr, ioerr, op, name, f.FileOperations)
-		partialResultOnce.Do(incrementPartialResultMetric)
-	}
-	return nil
-}
-
-// handleIOError handles special error cases for partial results. For some
-// errors, we may consume the error and return only the partial read/write.
-//
 // Returns false if error is unknown.
 func handleIOErrorImpl(ctx context.Context, partialResult bool, errOrig, intr error, op string) (bool, error) {
 	if errOrig == nil {
@@ -90,9 +70,9 @@ func handleIOErrorImpl(ctx context.Context, partialResult bool, errOrig, intr er
 	}
 
 	// Translate error, if possible, to consolidate errors from other packages
-	// into a smaller set of errors from syserror package.
+	// into a smaller set of errors from linuxerr package.
 	translatedErr := errOrig
-	if errno, ok := syserror.TranslateError(errOrig); ok {
+	if errno, ok := linuxerr.TranslateError(errOrig); ok {
 		translatedErr = errno
 	}
 	switch {
@@ -157,9 +137,12 @@ func handleIOErrorImpl(ctx context.Context, partialResult bool, errOrig, intr er
 		return true, nil
 	case linuxerr.Equals(linuxerr.ECONNRESET, translatedErr):
 		fallthrough
+	case linuxerr.Equals(linuxerr.ECONNABORTED, translatedErr):
+		fallthrough
 	case linuxerr.Equals(linuxerr.ETIMEDOUT, translatedErr):
-		// For TCP sendfile connections, we may have a reset or timeout. But we
-		// should just return n as the result.
+		// For TCP sendfile connections, we may have a reset, abort or timeout. But
+		// we should just return the partial result. The next call will return the
+		// error without a partial IO operation.
 		return true, nil
 	case linuxerr.Equals(linuxerr.EWOULDBLOCK, translatedErr):
 		// Syscall would block, but completed a partial read/write.
@@ -167,10 +150,7 @@ func handleIOErrorImpl(ctx context.Context, partialResult bool, errOrig, intr er
 		// files. Since we have a partial read/write, we consume
 		// ErrWouldBlock, returning the partial result.
 		return true, nil
-	}
-
-	switch errOrig.(type) {
-	case syserror.SyscallRestartErrno:
+	case linuxerr.IsRestartError(translatedErr):
 		// Identical to the EINTR case.
 		return true, nil
 	}

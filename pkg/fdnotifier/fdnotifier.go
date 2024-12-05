@@ -96,7 +96,7 @@ func (n *notifier) waitFD(fd int32, fi *fdInfo, mask waiter.EventMask) error {
 }
 
 // addFD adds an FD to the list of FDs observed by n.
-func (n *notifier) addFD(fd int32, queue *waiter.Queue) {
+func (n *notifier) addFD(fd int32, queue *waiter.Queue) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -105,8 +105,14 @@ func (n *notifier) addFD(fd int32, queue *waiter.Queue) {
 		panic(fmt.Sprintf("File descriptor %v added twice", fd))
 	}
 
-	// We have nothing to wait for at the moment. Just add it to the map.
-	n.fdMap[fd] = &fdInfo{queue: queue}
+	info := &fdInfo{queue: queue}
+	// We might already have something in queue to wait for.
+	if err := n.waitFD(fd, info, queue.Events()); err != nil {
+		return err
+	}
+	// Add it to the map.
+	n.fdMap[fd] = info
+	return nil
 }
 
 // updateFD updates the set of events the fd needs to be notified on.
@@ -155,13 +161,20 @@ func (n *notifier) waitAndNotify() error {
 			return err
 		}
 
+		notified := false
 		n.mu.Lock()
 		for i := 0; i < v; i++ {
 			if fi, ok := n.fdMap[e[i].Fd]; ok {
 				fi.queue.Notify(waiter.EventMaskFromLinux(e[i].Events))
+				notified = true
 			}
 		}
 		n.mu.Unlock()
+		if notified {
+			// Let goroutines woken by Notify get a chance to run before we
+			// epoll_wait again.
+			sync.Goyield()
+		}
 	}
 }
 
@@ -181,8 +194,7 @@ func AddFD(fd int32, queue *waiter.Queue) error {
 		return shared.initErr
 	}
 
-	shared.notifier.addFD(fd, queue)
-	return nil
+	return shared.notifier.addFD(fd, queue)
 }
 
 // UpdateFD updates the set of events the fd needs to be notified on.

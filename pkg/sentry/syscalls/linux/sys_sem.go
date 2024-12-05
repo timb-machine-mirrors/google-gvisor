@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
@@ -32,7 +31,7 @@ import (
 const opsMax = 500 // SEMOPM
 
 // Semget handles: semget(key_t key, int nsems, int semflg)
-func Semget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Semget(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	key := ipc.Key(args[0].Int())
 	nsems := args[1].Int()
 	flag := args[2].Int()
@@ -51,10 +50,10 @@ func Semget(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 }
 
 // Semtimedop handles: semop(int semid, struct sembuf *sops, size_t nsops, const struct timespec *timeout)
-func Semtimedop(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Semtimedop(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	// If the timeout argument is NULL, then semtimedop() behaves exactly like semop().
 	if args[3].Pointer() == 0 {
-		return Semop(t, args)
+		return Semop(t, sysno, args)
 	}
 
 	id := ipc.ID(args[0].Int())
@@ -91,7 +90,7 @@ func Semtimedop(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sy
 }
 
 // Semop handles: semop(int semid, struct sembuf *sops, size_t nsops)
-func Semop(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Semop(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	id := ipc.ID(args[0].Int())
 	sembufAddr := args[1].Pointer()
 	nsops := args[2].SizeT()
@@ -131,7 +130,7 @@ func semTimedOp(t *kernel.Task, id ipc.ID, ops []linux.Sembuf, haveTimeout bool,
 }
 
 // Semctl handles: semctl(int semid, int semnum, int cmd, ...)
-func Semctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Semctl(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	id := ipc.ID(args[0].Int())
 	num := args[1].Int()
 	cmd := args[2].Int()
@@ -166,8 +165,7 @@ func Semctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 			return 0, nil, err
 		}
 
-		perms := fs.FilePermsFromMode(linux.FileMode(s.SemPerm.Mode & 0777))
-		return 0, nil, ipcSet(t, id, auth.UID(s.SemPerm.UID), auth.GID(s.SemPerm.GID), perms)
+		return 0, nil, ipcSet(t, id, &s)
 
 	case linux.GETPID:
 		v, err := getPID(t, id, num)
@@ -243,24 +241,13 @@ func remove(t *kernel.Task, id ipc.ID) error {
 	return r.Remove(id, creds)
 }
 
-func ipcSet(t *kernel.Task, id ipc.ID, uid auth.UID, gid auth.GID, perms fs.FilePermissions) error {
+func ipcSet(t *kernel.Task, id ipc.ID, ds *linux.SemidDS) error {
 	r := t.IPCNamespace().SemaphoreRegistry()
 	set := r.FindByID(id)
 	if set == nil {
 		return linuxerr.EINVAL
 	}
-
-	creds := auth.CredentialsFromContext(t)
-	kuid := creds.UserNamespace.MapToKUID(uid)
-	if !kuid.Ok() {
-		return linuxerr.EINVAL
-	}
-	kgid := creds.UserNamespace.MapToKGID(gid)
-	if !kgid.Ok() {
-		return linuxerr.EINVAL
-	}
-	owner := fs.FileOwner{UID: kuid, GID: kgid}
-	return set.Change(t, creds, owner, perms)
+	return set.Set(t, ds)
 }
 
 func ipcStat(t *kernel.Task, id ipc.ID) (*linux.SemidDS, error) {

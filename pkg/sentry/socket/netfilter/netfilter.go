@@ -20,11 +20,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/rand"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -33,10 +35,10 @@ import (
 // enableLogging controls whether to log the (de)serialization of netfilter
 // structs between userspace and netstack. These logs are useful when
 // developing iptables, but can pollute sentry logs otherwise.
-const enableLogging = false
+const enableLogging = true
 
 // nflog logs messages related to the writing and reading of iptables.
-func nflog(format string, args ...interface{}) {
+func nflog(format string, args ...any) {
 	if enableLogging && log.IsLogging(log.Debug) {
 		log.Debugf("netfilter: "+format, args...)
 	}
@@ -58,8 +60,8 @@ var nameToID = map[string]stack.TableID{
 
 // DefaultLinuxTables returns the rules of stack.DefaultTables() wrapped for
 // compatibility with netfilter extensions.
-func DefaultLinuxTables(seed uint32) *stack.IPTables {
-	tables := stack.DefaultTables(seed)
+func DefaultLinuxTables(clock tcpip.Clock, rand *rand.Rand) *stack.IPTables {
+	tables := stack.DefaultTables(clock, rand)
 	tables.VisitTargets(func(oldTarget stack.Target) stack.Target {
 		switch val := oldTarget.(type) {
 		case *stack.AcceptTarget:
@@ -172,13 +174,17 @@ func setHooksAndUnderflow(info *linux.IPTGetinfo, table stack.Table, offset uint
 	}
 }
 
+// An IDMapper maps UIDs and GIDs to KUIDs and KGIDs.
+type IDMapper interface {
+	MapToKUID(uid auth.UID) auth.KUID
+	MapToKGID(uid auth.GID) auth.KGID
+}
+
 // SetEntries sets iptables rules for a single table. See
 // net/ipv4/netfilter/ip_tables.c:translate_table for reference.
-func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *syserr.Error {
+func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *syserr.Error {
 	var replace linux.IPTReplace
-	replaceBuf := optVal[:linux.SizeOfIPTReplace]
-	optVal = optVal[linux.SizeOfIPTReplace:]
-	replace.UnmarshalBytes(replaceBuf)
+	optVal = replace.UnmarshalBytes(optVal)
 
 	var table stack.Table
 	switch replace.Name.String() {
@@ -194,9 +200,9 @@ func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *
 	var err *syserr.Error
 	var offsets map[uint32]int
 	if ipv6 {
-		offsets, err = modifyEntries6(task, stk, optVal, &replace, &table)
+		offsets, err = modifyEntries6(mapper, stk, optVal, &replace, &table)
 	} else {
-		offsets, err = modifyEntries4(task, stk, optVal, &replace, &table)
+		offsets, err = modifyEntries4(mapper, stk, optVal, &replace, &table)
 	}
 	if err != nil {
 		return err
@@ -240,8 +246,8 @@ func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *
 
 		// We found a user chain. Before inserting it into the table,
 		// check that:
-		// - There's some other rule after it.
-		// - There are no matchers.
+		//	- There's some other rule after it.
+		//	- There are no matchers.
 		if ruleIdx == len(table.Rules)-1 {
 			nflog("user chain must have a rule or default policy")
 			return syserr.ErrInvalidArgument
@@ -271,31 +277,18 @@ func SetEntries(task *kernel.Task, stk *stack.Stack, optVal []byte, ipv6 bool) *
 		table.Rules[ruleIdx] = rule
 	}
 
-	// Since we don't support FORWARD, yet, make sure all other chains point to
-	// ACCEPT rules.
-	for hook, ruleIdx := range table.BuiltinChains {
-		if hook := stack.Hook(hook); hook == stack.Forward {
-			if ruleIdx == stack.HookUnset {
-				continue
-			}
-			if !isUnconditionalAccept(table.Rules[ruleIdx], ipv6) {
-				nflog("hook %d is unsupported.", hook)
-				return syserr.ErrInvalidArgument
-			}
-		}
-	}
-
 	// TODO(gvisor.dev/issue/6167): Check the following conditions:
-	// - There are no loops.
-	// - There are no chains without an unconditional final rule.
-	// - There are no chains without an unconditional underflow rule.
+	//	- There are no loops.
+	//	- There are no chains without an unconditional final rule.
+	//	- There are no chains without an unconditional underflow rule.
 
-	return syserr.TranslateNetstackError(stk.IPTables().ReplaceTable(nameToID[replace.Name.String()], table, ipv6))
+	stk.IPTables().ReplaceTable(nameToID[replace.Name.String()], table, ipv6)
+	return nil
 }
 
 // parseMatchers parses 0 or more matchers from optVal. optVal should contain
 // only the matchers.
-func parseMatchers(task *kernel.Task, filter stack.IPHeaderFilter, optVal []byte) ([]stack.Matcher, error) {
+func parseMatchers(mapper IDMapper, filter stack.IPHeaderFilter, optVal []byte) ([]stack.Matcher, error) {
 	nflog("set entries: parsing matchers of size %d", len(optVal))
 	var matchers []stack.Matcher
 	for len(optVal) > 0 {
@@ -306,8 +299,7 @@ func parseMatchers(task *kernel.Task, filter stack.IPHeaderFilter, optVal []byte
 			return nil, fmt.Errorf("optVal has insufficient size for entry match: %d", len(optVal))
 		}
 		var match linux.XTEntryMatch
-		buf := optVal[:match.SizeBytes()]
-		match.UnmarshalUnsafe(buf)
+		match.UnmarshalUnsafe(optVal)
 		nflog("set entries: parsed entry match %q: %+v", match.Name.String(), match)
 
 		// Check some invariants.
@@ -319,7 +311,7 @@ func parseMatchers(task *kernel.Task, filter stack.IPHeaderFilter, optVal []byte
 		}
 
 		// Parse the specific matcher.
-		matcher, err := unmarshalMatcher(task, match, filter, optVal[linux.SizeOfXTEntryMatch:match.MatchSize])
+		matcher, err := unmarshalMatcher(mapper, match, filter, optVal[linux.SizeOfXTEntryMatch:match.MatchSize])
 		if err != nil {
 			return nil, fmt.Errorf("failed to create matcher: %v", err)
 		}
@@ -386,9 +378,13 @@ func TargetRevision(t *kernel.Task, revPtr hostarch.Addr, netProto tcpip.Network
 	}
 	maxSupported, ok := targetRevision(rev.Name.String(), netProto, rev.Revision)
 	if !ok {
+		// Return ENOENT if there's no target with that name.
+		return linux.XTGetRevision{}, syserr.ErrNoFileOrDir
+	}
+	if maxSupported < rev.Revision {
+		// Return EPROTONOSUPPORT if we have an insufficient revision.
 		return linux.XTGetRevision{}, syserr.ErrProtocolNotSupported
 	}
-	rev.Revision = maxSupported
 	return rev, nil
 }
 

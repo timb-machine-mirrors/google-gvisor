@@ -21,12 +21,11 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 const (
@@ -151,14 +150,14 @@ func (r *Registry) FindOrCreate(ctx context.Context, key ipc.Key, nsems int32, m
 	// Map reg.objects and map indexes in a registry are of the same size,
 	// check map reg.objects only here for the system limit.
 	if r.reg.ObjectCount() >= setsMax {
-		return nil, syserror.ENOSPC
+		return nil, linuxerr.ENOSPC
 	}
 	if r.totalSems() > int(semsTotalMax-nsems) {
-		return nil, syserror.ENOSPC
+		return nil, linuxerr.ENOSPC
 	}
 
 	// Finally create a new set.
-	return r.newSetLocked(ctx, key, fs.FileOwnerFromContext(ctx), fs.FilePermsFromMode(mode), nsems)
+	return r.newSetLocked(ctx, key, auth.CredentialsFromContext(ctx), mode, nsems)
 }
 
 // IPCInfo returns information about system-wide semaphore limits and parameters.
@@ -229,10 +228,10 @@ func (r *Registry) Remove(id ipc.ID, creds *auth.Credentials) error {
 // are no more available identifiers.
 //
 // Precondition: r.mu must be held.
-func (r *Registry) newSetLocked(ctx context.Context, key ipc.Key, creator fs.FileOwner, perms fs.FilePermissions, nsems int32) (*Set, error) {
+func (r *Registry) newSetLocked(ctx context.Context, key ipc.Key, creator *auth.Credentials, mode linux.FileMode, nsems int32) (*Set, error) {
 	set := &Set{
 		registry:   r,
-		obj:        ipc.NewObject(r.reg.UserNS, ipc.Key(key), creator, creator, perms),
+		obj:        ipc.NewObject(r.reg.UserNS, ipc.Key(key), creator, creator, mode),
 		changeTime: ktime.NowFromContext(ctx),
 		sems:       make([]sem, nsems),
 	}
@@ -337,19 +336,15 @@ func (s *Set) Size() int {
 	return len(s.sems)
 }
 
-// Change changes some fields from the set atomically.
-func (s *Set) Change(ctx context.Context, creds *auth.Credentials, owner fs.FileOwner, perms fs.FilePermissions) error {
+// Set modifies attributes for a semaphore set. See semctl(IPC_SET).
+func (s *Set) Set(ctx context.Context, ds *linux.SemidDS) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// "The effective UID of the calling process must match the owner or creator
-	// of the semaphore set, or the caller must be privileged."
-	if !s.obj.CheckOwnership(creds) {
-		return linuxerr.EACCES
+	if err := s.obj.Set(ctx, &ds.SemPerm); err != nil {
+		return err
 	}
 
-	s.obj.Owner = owner
-	s.obj.Perms = perms
 	s.changeTime = ktime.NowFromContext(ctx)
 	return nil
 }
@@ -357,30 +352,30 @@ func (s *Set) Change(ctx context.Context, creds *auth.Credentials, owner fs.File
 // GetStat extracts semid_ds information from the set.
 func (s *Set) GetStat(creds *auth.Credentials) (*linux.SemidDS, error) {
 	// "The calling process must have read permission on the semaphore set."
-	return s.semStat(creds, fs.PermMask{Read: true})
+	return s.semStat(creds, vfs.MayRead)
 }
 
 // GetStatAny extracts semid_ds information from the set without requiring read access.
 func (s *Set) GetStatAny(creds *auth.Credentials) (*linux.SemidDS, error) {
-	return s.semStat(creds, fs.PermMask{})
+	return s.semStat(creds, 0)
 }
 
-func (s *Set) semStat(creds *auth.Credentials, permMask fs.PermMask) (*linux.SemidDS, error) {
+func (s *Set) semStat(creds *auth.Credentials, ats vfs.AccessTypes) (*linux.SemidDS, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !s.obj.CheckPermissions(creds, permMask) {
+	if !s.obj.CheckPermissions(creds, ats) {
 		return nil, linuxerr.EACCES
 	}
 
 	return &linux.SemidDS{
 		SemPerm: linux.IPCPerm{
 			Key:  uint32(s.obj.Key),
-			UID:  uint32(creds.UserNamespace.MapFromKUID(s.obj.Owner.UID)),
-			GID:  uint32(creds.UserNamespace.MapFromKGID(s.obj.Owner.GID)),
-			CUID: uint32(creds.UserNamespace.MapFromKUID(s.obj.Creator.UID)),
-			CGID: uint32(creds.UserNamespace.MapFromKGID(s.obj.Creator.GID)),
-			Mode: uint16(s.obj.Perms.LinuxMode()),
+			UID:  uint32(creds.UserNamespace.MapFromKUID(s.obj.OwnerUID)),
+			GID:  uint32(creds.UserNamespace.MapFromKGID(s.obj.OwnerGID)),
+			CUID: uint32(creds.UserNamespace.MapFromKUID(s.obj.CreatorUID)),
+			CGID: uint32(creds.UserNamespace.MapFromKGID(s.obj.CreatorGID)),
+			Mode: uint16(s.obj.Mode),
 			Seq:  0, // IPC sequence not supported.
 		},
 		SemOTime: s.opTime.TimeT(),
@@ -399,7 +394,7 @@ func (s *Set) SetVal(ctx context.Context, num int32, val int16, creds *auth.Cred
 	defer s.mu.Unlock()
 
 	// "The calling process must have alter permission on the semaphore set."
-	if !s.obj.CheckPermissions(creds, fs.PermMask{Write: true}) {
+	if !s.obj.CheckPermissions(creds, vfs.MayWrite) {
 		return linuxerr.EACCES
 	}
 
@@ -435,7 +430,7 @@ func (s *Set) SetValAll(ctx context.Context, vals []uint16, creds *auth.Credenti
 	defer s.mu.Unlock()
 
 	// "The calling process must have alter permission on the semaphore set."
-	if !s.obj.CheckPermissions(creds, fs.PermMask{Write: true}) {
+	if !s.obj.CheckPermissions(creds, vfs.MayWrite) {
 		return linuxerr.EACCES
 	}
 
@@ -457,7 +452,7 @@ func (s *Set) GetVal(num int32, creds *auth.Credentials) (int16, error) {
 	defer s.mu.Unlock()
 
 	// "The calling process must have read permission on the semaphore set."
-	if !s.obj.CheckPermissions(creds, fs.PermMask{Read: true}) {
+	if !s.obj.CheckPermissions(creds, vfs.MayRead) {
 		return 0, linuxerr.EACCES
 	}
 
@@ -474,7 +469,7 @@ func (s *Set) GetValAll(creds *auth.Credentials) ([]uint16, error) {
 	defer s.mu.Unlock()
 
 	// "The calling process must have read permission on the semaphore set."
-	if !s.obj.CheckPermissions(creds, fs.PermMask{Read: true}) {
+	if !s.obj.CheckPermissions(creds, vfs.MayRead) {
 		return nil, linuxerr.EACCES
 	}
 
@@ -491,7 +486,7 @@ func (s *Set) GetPID(num int32, creds *auth.Credentials) (int32, error) {
 	defer s.mu.Unlock()
 
 	// "The calling process must have read permission on the semaphore set."
-	if !s.obj.CheckPermissions(creds, fs.PermMask{Read: true}) {
+	if !s.obj.CheckPermissions(creds, vfs.MayRead) {
 		return 0, linuxerr.EACCES
 	}
 
@@ -507,7 +502,7 @@ func (s *Set) countWaiters(num int32, creds *auth.Credentials, pred func(w *wait
 	defer s.mu.Unlock()
 
 	// The calling process must have read permission on the semaphore set.
-	if !s.obj.CheckPermissions(creds, fs.PermMask{Read: true}) {
+	if !s.obj.CheckPermissions(creds, vfs.MayRead) {
 		return 0, linuxerr.EACCES
 	}
 
@@ -549,7 +544,7 @@ func (s *Set) ExecuteOps(ctx context.Context, ops []linux.Sembuf, creds *auth.Cr
 
 	// Did it race with a removal operation?
 	if s.dead {
-		return nil, 0, syserror.EIDRM
+		return nil, 0, linuxerr.EIDRM
 	}
 
 	// Validate the operations.
@@ -563,7 +558,11 @@ func (s *Set) ExecuteOps(ctx context.Context, ops []linux.Sembuf, creds *auth.Cr
 		}
 	}
 
-	if !s.obj.CheckPermissions(creds, fs.PermMask{Read: readOnly, Write: !readOnly}) {
+	ats := vfs.MayRead
+	if !readOnly {
+		ats = vfs.MayWrite
+	}
+	if !s.obj.CheckPermissions(creds, ats) {
 		return nil, 0, linuxerr.EACCES
 	}
 
@@ -588,7 +587,7 @@ func (s *Set) executeOps(ctx context.Context, ops []linux.Sembuf, pid int32) (ch
 			if tmpVals[op.SemNum] != 0 {
 				// Semaphore isn't 0, must wait.
 				if op.SemFlg&linux.IPC_NOWAIT != 0 {
-					return nil, 0, syserror.ErrWouldBlock
+					return nil, 0, linuxerr.ErrWouldBlock
 				}
 
 				w := newWaiter(op.SemOp)
@@ -604,7 +603,7 @@ func (s *Set) executeOps(ctx context.Context, ops []linux.Sembuf, pid int32) (ch
 				if -op.SemOp > tmpVals[op.SemNum] {
 					// Not enough resources, must wait.
 					if op.SemFlg&linux.IPC_NOWAIT != 0 {
-						return nil, 0, syserror.ErrWouldBlock
+						return nil, 0, linuxerr.ErrWouldBlock
 					}
 
 					w := newWaiter(op.SemOp)

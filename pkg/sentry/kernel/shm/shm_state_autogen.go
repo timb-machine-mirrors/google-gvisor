@@ -3,6 +3,8 @@
 package shm
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
@@ -28,10 +30,10 @@ func (r *Registry) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(2, &r.totalPages)
 }
 
-func (r *Registry) afterLoad() {}
+func (r *Registry) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (r *Registry) StateLoad(stateSourceObject state.Source) {
+func (r *Registry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.userNS)
 	stateSourceObject.Load(1, &r.reg)
 	stateSourceObject.Load(2, &r.totalPages)
@@ -44,8 +46,8 @@ func (s *Shm) StateTypeName() string {
 func (s *Shm) StateFields() []string {
 	return []string{
 		"ShmRefs",
-		"mfp",
 		"registry",
+		"devID",
 		"size",
 		"effectiveSize",
 		"fr",
@@ -65,8 +67,8 @@ func (s *Shm) beforeSave() {}
 func (s *Shm) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
 	stateSinkObject.Save(0, &s.ShmRefs)
-	stateSinkObject.Save(1, &s.mfp)
-	stateSinkObject.Save(2, &s.registry)
+	stateSinkObject.Save(1, &s.registry)
+	stateSinkObject.Save(2, &s.devID)
 	stateSinkObject.Save(3, &s.size)
 	stateSinkObject.Save(4, &s.effectiveSize)
 	stateSinkObject.Save(5, &s.fr)
@@ -79,13 +81,11 @@ func (s *Shm) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(12, &s.pendingDestruction)
 }
 
-func (s *Shm) afterLoad() {}
-
 // +checklocksignore
-func (s *Shm) StateLoad(stateSourceObject state.Source) {
+func (s *Shm) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &s.ShmRefs)
-	stateSourceObject.Load(1, &s.mfp)
-	stateSourceObject.Load(2, &s.registry)
+	stateSourceObject.Load(1, &s.registry)
+	stateSourceObject.Load(2, &s.devID)
 	stateSourceObject.Load(3, &s.size)
 	stateSourceObject.Load(4, &s.effectiveSize)
 	stateSourceObject.Load(5, &s.fr)
@@ -96,6 +96,7 @@ func (s *Shm) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(10, &s.creatorPID)
 	stateSourceObject.Load(11, &s.lastAttachDetachPID)
 	stateSourceObject.Load(12, &s.pendingDestruction)
+	stateSourceObject.AfterLoad(func() { s.afterLoad(ctx) })
 }
 
 func (r *ShmRefs) StateTypeName() string {
@@ -117,9 +118,9 @@ func (r *ShmRefs) StateSave(stateSinkObject state.Sink) {
 }
 
 // +checklocksignore
-func (r *ShmRefs) StateLoad(stateSourceObject state.Source) {
+func (r *ShmRefs) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.refCount)
-	stateSourceObject.AfterLoad(r.afterLoad)
+	stateSourceObject.AfterLoad(func() { r.afterLoad(ctx) })
 }
 
 func init() {

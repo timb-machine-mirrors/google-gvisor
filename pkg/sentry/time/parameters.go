@@ -107,19 +107,19 @@ func (p Parameters) ComputeTime(nowCycles TSCValue) (int64, bool) {
 // errorAdjust returns a new Parameters struct "adjusted" that satisfies:
 //
 // 1. adjusted.ComputeTime(now) = prevParams.ComputeTime(now)
-//   * i.e., the current time does not jump.
+//   - i.e., the current time does not jump.
 //
 // 2. adjusted.ComputeTime(TSC at next update) = newParams.ComputeTime(TSC at next update)
-//   * i.e., Any error between prevParams and newParams will be corrected over
+//   - i.e., Any error between prevParams and newParams will be corrected over
 //     the course of the next update period.
 //
 // errorAdjust also returns the current clock error.
 //
 // Preconditions:
-// * newParams.BaseCycles >= prevParams.BaseCycles; i.e., TSC must not go
-//   backwards.
-// * newParams.BaseCycles <= now; i.e., the new parameters be computed at or
-//   before now.
+//   - newParams.BaseCycles >= prevParams.BaseCycles; i.e., TSC must not go
+//     backwards.
+//   - newParams.BaseCycles <= now; i.e., the new parameters be computed at or
+//     before now.
 func errorAdjust(prevParams Parameters, newParams Parameters, now TSCValue) (Parameters, ReferenceNS, error) {
 	if newParams.BaseCycles < prevParams.BaseCycles {
 		// Oh dear! Something is very wrong.
@@ -229,15 +229,15 @@ func errorAdjust(prevParams Parameters, newParams Parameters, now TSCValue) (Par
 // The log level is determined by the error severity.
 func logErrorAdjustment(clock ClockID, errorNS ReferenceNS, orig, adjusted Parameters) {
 	magNS := int64(errorNS.Magnitude())
-	if magNS <= 10*time.Microsecond.Nanoseconds() {
-		// Don't log small errors.
+	switch {
+	case magNS < time.Millisecond.Nanoseconds():
+		// Less than a millisecond. Too small to care.
 		return
+	case magNS < 5*time.Millisecond.Nanoseconds():
+		// Less than 5 milliseconds. Log at info.
+		log.Infof("Clock(%v): error: %v ns, adjusted frequency from %v Hz to %v Hz", clock, errorNS, orig.Frequency, adjusted.Frequency)
+	default:
+		// More than 5 milliseconds. This is getting interesting. Log at warning.
+		log.Warningf("Clock(%v): error: %v ns, adjusted frequency from %v Hz to %v Hz", clock, errorNS, orig.Frequency, adjusted.Frequency)
 	}
-	fn := log.Infof
-	if magNS > time.Millisecond.Nanoseconds() {
-		// Upgrade large errors to warning.
-		fn = log.Warningf
-	}
-
-	fn("Clock(%v): error: %v ns, adjusted frequency from %v Hz to %v Hz", clock, errorNS, orig.Frequency, adjusted.Frequency)
 }

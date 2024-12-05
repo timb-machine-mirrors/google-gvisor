@@ -15,14 +15,38 @@
 package vfs
 
 import (
+	goContext "context"
 	"fmt"
 	"sync/atomic"
 
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+// ErrCorruption indicates a failed restore due to external file system state in
+// corruption.
+type ErrCorruption struct {
+	// Err is the wrapped error.
+	Err error
+}
+
+// Error returns a sensible description of the restore error.
+func (e ErrCorruption) Error() string {
+	return "restore failed due to external file system state in corruption: " + e.Err.Error()
+}
+
+// PrependErrMsg prepends the passed prefix to the error while preserving
+// special vfs errors as the outer most error.
+func PrependErrMsg(prefix string, err error) error {
+	switch terr := err.(type) {
+	case ErrCorruption:
+		terr.Err = fmt.Errorf("%s: %w", prefix, terr.Err)
+		return terr
+	default:
+		return fmt.Errorf("%s: %w", prefix, err)
+	}
+}
 
 // FilesystemImplSaveRestoreExtension is an optional extension to
 // FilesystemImpl.
@@ -37,18 +61,14 @@ type FilesystemImplSaveRestoreExtension interface {
 
 // PrepareSave prepares all filesystems for serialization.
 func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context) error {
-	failures := 0
 	for fs := range vfs.getFilesystems() {
 		if ext, ok := fs.impl.(FilesystemImplSaveRestoreExtension); ok {
 			if err := ext.PrepareSave(ctx); err != nil {
-				ctx.Warningf("%T.PrepareSave failed: %v", fs.impl, err)
-				failures++
+				fs.DecRef(ctx)
+				return err
 			}
 		}
 		fs.DecRef(ctx)
-	}
-	if failures != 0 {
-		return fmt.Errorf("%d filesystems failed to prepare for serialization", failures)
 	}
 	return nil
 }
@@ -56,18 +76,14 @@ func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context) error {
 // CompleteRestore completes restoration from checkpoint for all filesystems
 // after deserialization.
 func (vfs *VirtualFilesystem) CompleteRestore(ctx context.Context, opts *CompleteRestoreOptions) error {
-	failures := 0
 	for fs := range vfs.getFilesystems() {
 		if ext, ok := fs.impl.(FilesystemImplSaveRestoreExtension); ok {
 			if err := ext.CompleteRestore(ctx, *opts); err != nil {
-				ctx.Warningf("%T.CompleteRestore failed: %v", fs.impl, err)
-				failures++
+				fs.DecRef(ctx)
+				return PrependErrMsg(fmt.Sprintf("failed to complete restore for filesystem type %q", fs.fsType.Name()), err)
 			}
 		}
 		fs.DecRef(ctx)
-	}
-	if failures != 0 {
-		return fmt.Errorf("%d filesystems failed to complete restore after deserialization", failures)
 	}
 	return nil
 }
@@ -104,8 +120,18 @@ func (vfs *VirtualFilesystem) saveMounts() []*Mount {
 // saveKey is called by stateify.
 func (mnt *Mount) saveKey() VirtualDentry { return mnt.getKey() }
 
+// saveMountPromises is called by stateify.
+func (vfs *VirtualFilesystem) saveMountPromises() map[VirtualDentry]*mountPromise {
+	m := make(map[VirtualDentry]*mountPromise)
+	vfs.mountPromises.Range(func(key any, val any) bool {
+		m[key.(VirtualDentry)] = val.(*mountPromise)
+		return true
+	})
+	return m
+}
+
 // loadMounts is called by stateify.
-func (vfs *VirtualFilesystem) loadMounts(mounts []*Mount) {
+func (vfs *VirtualFilesystem) loadMounts(_ goContext.Context, mounts []*Mount) {
 	if mounts == nil {
 		return
 	}
@@ -116,32 +142,40 @@ func (vfs *VirtualFilesystem) loadMounts(mounts []*Mount) {
 }
 
 // loadKey is called by stateify.
-func (mnt *Mount) loadKey(vd VirtualDentry) { mnt.setKey(vd) }
+func (mnt *Mount) loadKey(_ goContext.Context, vd VirtualDentry) { mnt.setKey(vd) }
 
-func (mnt *Mount) afterLoad() {
-	if atomic.LoadInt64(&mnt.refs) != 0 {
-		refsvfs2.Register(mnt)
+// loadMountPromises is called by stateify.
+func (vfs *VirtualFilesystem) loadMountPromises(_ goContext.Context, mps map[VirtualDentry]*mountPromise) {
+	for vd, mp := range mps {
+		vfs.mountPromises.Store(vd, mp)
 	}
 }
 
 // afterLoad is called by stateify.
-func (epi *epollInterest) afterLoad() {
+func (mnt *Mount) afterLoad(goContext.Context) {
+	if mnt.refs.Load() != 0 {
+		refs.Register(mnt)
+	}
+}
+
+// afterLoad is called by stateify.
+func (epi *epollInterest) afterLoad(goContext.Context) {
 	// Mark all epollInterests as ready after restore so that the next call to
 	// EpollInstance.ReadEvents() rechecks their readiness.
-	epi.Callback(nil, waiter.EventMaskFromLinux(epi.mask))
+	epi.waiter.NotifyEvent(waiter.EventMaskFromLinux(epi.mask))
 }
 
-// beforeSave is called by stateify.
-func (fd *FileDescription) beforeSave() {
-	fd.saved = true
-	if fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
-		fd.asyncHandler.Unregister(fd)
-	}
+// RestoreID is a unique ID that is used to identify resources between save/restore sessions.
+// Example of resources are host files, gofer connection for mount points, etc.
+//
+// +stateify savable
+type RestoreID struct {
+	// ContainerName is the name of the container that the resource belongs to.
+	ContainerName string
+	// Path is the path of the resource.
+	Path string
 }
 
-// afterLoad is called by stateify.
-func (fd *FileDescription) afterLoad() {
-	if fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
-		fd.asyncHandler.Register(fd)
-	}
+func (f RestoreID) String() string {
+	return fmt.Sprintf("%s:%s", f.ContainerName, f.Path)
 }

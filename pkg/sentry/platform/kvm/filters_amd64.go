@@ -21,20 +21,40 @@ import (
 	"gvisor.dev/gvisor/pkg/seccomp"
 )
 
-// SyscallFilters returns syscalls made exclusively by the KVM platform.
-func (*KVM) SyscallFilters() seccomp.SyscallRules {
-	return seccomp.SyscallRules{
-		unix.SYS_ARCH_PRCTL: {},
-		unix.SYS_IOCTL:      {},
-		unix.SYS_MEMBARRIER: []seccomp.Rule{
-			{
-				seccomp.EqualTo(linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED),
-				seccomp.EqualTo(0),
+// archSyscallFilters returns arch-specific syscalls made exclusively by the
+// KVM platform.
+func (k *KVM) archSyscallFilters() seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_ARCH_PRCTL: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.EqualTo(linux.ARCH_GET_FS),
+			},
+			seccomp.PerArg{
+				seccomp.EqualTo(linux.ARCH_GET_GS),
 			},
 		},
-		unix.SYS_MMAP:            {},
-		unix.SYS_RT_SIGSUSPEND:   {},
-		unix.SYS_RT_SIGTIMEDWAIT: {},
-		0xffffffffffffffff:       {}, // KVM uses syscall -1 to transition to host.
+		unix.SYS_IOCTL: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(KVM_INTERRUPT),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(KVM_NMI),
+			},
+			seccomp.PerArg{
+				seccomp.NonNegativeFD{},
+				seccomp.EqualTo(KVM_GET_REGS),
+			},
+		},
+	})
+}
+
+// hottestSyscalls returns the list of hot syscalls for the KVM platform.
+func hottestSyscalls() []uintptr {
+	return []uintptr{
+		unix.SYS_FUTEX,
+		unix.SYS_IOCTL,
+		unix.SYS_RT_SIGRETURN,
 	}
 }

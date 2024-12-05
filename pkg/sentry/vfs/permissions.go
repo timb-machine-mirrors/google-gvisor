@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 // AccessTypes is a bitmask of Unix file permissions.
@@ -133,14 +132,14 @@ func MayLink(creds *auth.Credentials, mode linux.FileMode, kuid auth.KUID, kgid 
 // with the given OpenOptions.Flags. Note that this is NOT the same thing as
 // the set of accesses permitted for the opened file:
 //
-// - O_TRUNC causes MayWrite to be set in the returned AccessTypes (since it
-// mutates the file), but does not permit writing to the open file description
-// thereafter.
+//   - O_TRUNC causes MayWrite to be set in the returned AccessTypes (since it
+//     mutates the file), but does not permit writing to the open file description
+//     thereafter.
 //
-// - "Linux reserves the special, nonstandard access mode 3 (binary 11) in
-// flags to mean: check for read and write permission on the file and return a
-// file descriptor that can't be used for reading or writing." - open(2). Thus
-// AccessTypesForOpenFlags returns MayRead|MayWrite in this case.
+//   - "Linux reserves the special, nonstandard access mode 3 (binary 11) in
+//     flags to mean: check for read and write permission on the file and return a
+//     file descriptor that can't be used for reading or writing." - open(2). Thus
+//     AccessTypesForOpenFlags returns MayRead|MayWrite in this case.
 //
 // Use May{Read,Write}FileWithOpenFlags() for these checks instead.
 func AccessTypesForOpenFlags(opts *OpenOptions) AccessTypes {
@@ -195,7 +194,7 @@ func CheckSetStat(ctx context.Context, creds *auth.Credentials, opts *SetStatOpt
 			return err
 		}
 		if limit < int64(stat.Size) {
-			return syserror.ErrExceedsFileSizeLimit
+			return linuxerr.ErrExceedsFileSizeLimit
 		}
 	}
 	if stat.Mask&linux.STATX_MODE != 0 {
@@ -282,7 +281,7 @@ func CheckLimit(ctx context.Context, offset, size int64) (int64, error) {
 		return size, nil
 	}
 	if offset >= int64(fileSizeLimit) {
-		return 0, syserror.ErrExceedsFileSizeLimit
+		return 0, linuxerr.ErrExceedsFileSizeLimit
 	}
 	remaining := int64(fileSizeLimit) - offset
 	if remaining < size {
@@ -293,11 +292,11 @@ func CheckLimit(ctx context.Context, offset, size int64) (int64, error) {
 
 // CheckXattrPermissions checks permissions for extended attribute access.
 // This is analogous to fs/xattr.c:xattr_permission(). Some key differences:
-// * Does not check for read-only filesystem property.
-// * Does not check inode immutability or append only mode. In both cases EPERM
-//   must be returned by filesystem implementations.
-// * Does not do inode permission checks. Filesystem implementations should
-//   handle inode permission checks as they may differ across implementations.
+//   - Does not check for read-only filesystem property.
+//   - Does not check inode immutability or append only mode. In both cases EPERM
+//     must be returned by filesystem implementations.
+//   - Does not do inode permission checks. Filesystem implementations should
+//     handle inode permission checks as they may differ across implementations.
 func CheckXattrPermissions(creds *auth.Credentials, ats AccessTypes, mode linux.FileMode, kuid auth.KUID, name string) error {
 	switch {
 	case strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX):
@@ -324,6 +323,11 @@ func CheckXattrPermissions(creds *auth.Credentials, ats AccessTypes, mode linux.
 		if filetype == linux.ModeDirectory && mode&linux.ModeSticky != 0 && ats.MayWrite() && !CanActAsOwner(creds, kuid) {
 			return linuxerr.EPERM
 		}
+	case strings.HasPrefix(name, linux.XATTR_SECURITY_PREFIX):
+		if ats.MayRead() {
+			return nil
+		}
+		return linuxerr.EOPNOTSUPP
 	}
 	return nil
 }

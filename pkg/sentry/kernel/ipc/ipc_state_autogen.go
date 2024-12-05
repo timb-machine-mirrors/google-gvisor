@@ -3,6 +3,8 @@
 package ipc
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
@@ -15,9 +17,11 @@ func (o *Object) StateFields() []string {
 		"UserNS",
 		"ID",
 		"Key",
-		"Creator",
-		"Owner",
-		"Perms",
+		"CreatorUID",
+		"CreatorGID",
+		"OwnerUID",
+		"OwnerGID",
+		"Mode",
 	}
 }
 
@@ -29,21 +33,25 @@ func (o *Object) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &o.UserNS)
 	stateSinkObject.Save(1, &o.ID)
 	stateSinkObject.Save(2, &o.Key)
-	stateSinkObject.Save(3, &o.Creator)
-	stateSinkObject.Save(4, &o.Owner)
-	stateSinkObject.Save(5, &o.Perms)
+	stateSinkObject.Save(3, &o.CreatorUID)
+	stateSinkObject.Save(4, &o.CreatorGID)
+	stateSinkObject.Save(5, &o.OwnerUID)
+	stateSinkObject.Save(6, &o.OwnerGID)
+	stateSinkObject.Save(7, &o.Mode)
 }
 
-func (o *Object) afterLoad() {}
+func (o *Object) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (o *Object) StateLoad(stateSourceObject state.Source) {
+func (o *Object) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &o.UserNS)
 	stateSourceObject.Load(1, &o.ID)
 	stateSourceObject.Load(2, &o.Key)
-	stateSourceObject.Load(3, &o.Creator)
-	stateSourceObject.Load(4, &o.Owner)
-	stateSourceObject.Load(5, &o.Perms)
+	stateSourceObject.Load(3, &o.CreatorUID)
+	stateSourceObject.Load(4, &o.CreatorGID)
+	stateSourceObject.Load(5, &o.OwnerUID)
+	stateSourceObject.Load(6, &o.OwnerGID)
+	stateSourceObject.Load(7, &o.Mode)
 }
 
 func (r *Registry) StateTypeName() string {
@@ -70,10 +78,10 @@ func (r *Registry) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(3, &r.lastIDUsed)
 }
 
-func (r *Registry) afterLoad() {}
+func (r *Registry) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (r *Registry) StateLoad(stateSourceObject state.Source) {
+func (r *Registry) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.UserNS)
 	stateSourceObject.Load(1, &r.objects)
 	stateSourceObject.Load(2, &r.keysToIDs)

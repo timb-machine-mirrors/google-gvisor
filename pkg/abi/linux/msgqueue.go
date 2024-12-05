@@ -47,10 +47,10 @@ const (
 	MSGSSZ  = 16
 
 	// MSGSEG is simplified due to the inexistance of a ternary operator.
-	MSGSEG = (MSGPOOL * 1024) / MSGSSZ
+	MSGSEG = 0xffff
 )
 
-// MsqidDS is equivelant to struct msqid64_ds. Source:
+// MsqidDS is equivalent to struct msqid64_ds. Source:
 // include/uapi/asm-generic/shmbuf.h
 //
 // +marshal
@@ -68,7 +68,7 @@ type MsqidDS struct {
 	unused5   uint64
 }
 
-// MsgBuf is equivelant to struct msgbuf. Source: include/uapi/linux/msg.h
+// MsgBuf is equivalent to struct msgbuf. Source: include/uapi/linux/msg.h
 //
 // +marshal dynamic
 type MsgBuf struct {
@@ -82,18 +82,18 @@ func (b *MsgBuf) SizeBytes() int {
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
-func (b *MsgBuf) MarshalBytes(dst []byte) {
-	b.Type.MarshalUnsafe(dst)
-	b.Text.MarshalBytes(dst[b.Type.SizeBytes():])
+func (b *MsgBuf) MarshalBytes(dst []byte) []byte {
+	dst = b.Type.MarshalUnsafe(dst)
+	return b.Text.MarshalBytes(dst)
 }
 
 // UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
-func (b *MsgBuf) UnmarshalBytes(src []byte) {
-	b.Type.UnmarshalUnsafe(src)
-	b.Text.UnmarshalBytes(src[b.Type.SizeBytes():])
+func (b *MsgBuf) UnmarshalBytes(src []byte) []byte {
+	src = b.Type.UnmarshalUnsafe(src)
+	return b.Text.UnmarshalBytes(src)
 }
 
-// MsgInfo is equivelant to struct msginfo. Source: include/uapi/linux/msg.h
+// MsgInfo is equivalent to struct msginfo. Source: include/uapi/linux/msg.h
 //
 // +marshal
 type MsgInfo struct {

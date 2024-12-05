@@ -15,20 +15,21 @@
 package gofer
 
 import (
-	"sync/atomic"
+	"fmt"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/metric"
-	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -41,6 +42,8 @@ import (
 // +stateify savable
 type specialFileFD struct {
 	fileDescription
+	specialFDEntry
+	memmap.NoBufferedIOFallback
 
 	// releaseMu synchronizes the closing of fd.handle with fd.sync(). It's safe
 	// to access fd.handle without locking for operations that require a ref to
@@ -71,17 +74,26 @@ type specialFileFD struct {
 
 	// If haveBuf is non-zero, this FD represents a pipe, and buf contains data
 	// read from the pipe from previous calls to specialFileFD.savePipeData().
-	// haveBuf and buf are protected by bufMu. haveBuf is accessed using atomic
-	// memory operations.
+	// haveBuf and buf are protected by bufMu.
 	bufMu   sync.Mutex `state:"nosave"`
-	haveBuf uint32
+	haveBuf atomicbitops.Uint32
 	buf     []byte
+
+	// If handle.fd >= 0, hostFileMapper caches mappings of handle.fd, and
+	// hostFileMapperInitOnce is used to initialize it on first use.
+	hostFileMapperInitOnce sync.Once `state:"nosave"`
+	hostFileMapper         fsutil.HostFileMapper
+
+	// If handle.fd >= 0, fileRefs counts references on memmap.File offsets.
+	// fileRefs is protected by fileRefsMu.
+	fileRefsMu sync.Mutex `state:"nosave"`
+	fileRefs   fsutil.FrameRefSet
 }
 
 func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, flags uint32) (*specialFileFD, error) {
 	ftype := d.fileType()
 	seekable := ftype == linux.S_IFREG || ftype == linux.S_IFCHR || ftype == linux.S_IFBLK
-	haveQueue := (ftype == linux.S_IFIFO || ftype == linux.S_IFSOCK) && h.fd >= 0
+	haveQueue := (ftype == linux.S_IFIFO || ftype == linux.S_IFSOCK || ftype == linux.S_IFCHR) && h.fd >= 0
 	fd := &specialFileFD{
 		handle:        h,
 		isRegularFile: ftype == linux.S_IFREG,
@@ -95,8 +107,9 @@ func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, flags uint32) (*speci
 		}
 	}
 	if err := fd.vfsfd.Init(fd, flags, mnt, &d.vfsd, &vfs.FileDescriptionOptions{
-		DenyPRead:  !seekable,
-		DenyPWrite: !seekable,
+		AllowDirectIO: true,
+		DenyPRead:     !seekable,
+		DenyPWrite:    !seekable,
 	}); err != nil {
 		if haveQueue {
 			fdnotifier.RemoveFD(h.fd)
@@ -104,10 +117,10 @@ func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, flags uint32) (*speci
 		return nil, err
 	}
 	d.fs.syncMu.Lock()
-	d.fs.specialFileFDs[fd] = struct{}{}
+	d.fs.specialFileFDs.PushBack(fd)
 	d.fs.syncMu.Unlock()
-	if fd.vfsfd.IsWritable() && (atomic.LoadUint32(&d.mode)&0111 != 0) {
-		metric.SuspiciousOperationsMetric.Increment("opened_write_execute_file")
+	if fd.vfsfd.IsWritable() && (d.mode.Load()&0111 != 0) {
+		metric.SuspiciousOperationsMetric.Increment(&metric.SuspiciousOperationsTypeOpenedWriteExecuteFile)
 	}
 	if h.fd >= 0 {
 		fsmetric.GoferOpensHost.Increment()
@@ -128,7 +141,7 @@ func (fd *specialFileFD) Release(ctx context.Context) {
 
 	fs := fd.vfsfd.Mount().Filesystem().Impl().(*filesystem)
 	fs.syncMu.Lock()
-	delete(fs.specialFileFDs, fd)
+	fs.specialFileFDs.Remove(fd)
 	fs.syncMu.Unlock()
 }
 
@@ -137,7 +150,7 @@ func (fd *specialFileFD) OnClose(ctx context.Context) error {
 	if !fd.vfsfd.IsWritable() {
 		return nil
 	}
-	return fd.handle.file.flush(ctx)
+	return flush(ctx, fd.handle.fdLisa)
 }
 
 // Readiness implements waiter.Waitable.Readiness.
@@ -149,30 +162,43 @@ func (fd *specialFileFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (fd *specialFileFD) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (fd *specialFileFD) EventRegister(e *waiter.Entry) error {
 	if fd.haveQueue {
-		fd.queue.EventRegister(e, mask)
-		fdnotifier.UpdateFD(fd.handle.fd)
-		return
+		fd.queue.EventRegister(e)
+		if err := fdnotifier.UpdateFD(fd.handle.fd); err != nil {
+			fd.queue.EventUnregister(e)
+			return err
+		}
+		return nil
 	}
-	fd.fileDescription.EventRegister(e, mask)
+	return fd.fileDescription.EventRegister(e)
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (fd *specialFileFD) EventUnregister(e *waiter.Entry) {
 	if fd.haveQueue {
 		fd.queue.EventUnregister(e)
-		fdnotifier.UpdateFD(fd.handle.fd)
+		if err := fdnotifier.UpdateFD(fd.handle.fd); err != nil {
+			panic(fmt.Sprint("UpdateFD:", err))
+		}
 		return
 	}
 	fd.fileDescription.EventUnregister(e)
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (fd *specialFileFD) Epollable() bool {
+	if fd.haveQueue {
+		return true
+	}
+	return fd.fileDescription.Epollable()
 }
 
 func (fd *specialFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	if fd.isRegularFile {
 		d := fd.dentry()
 		return d.doAllocate(ctx, offset, length, func() error {
-			return fd.handle.file.allocate(ctx, p9.ToAllocateMode(mode), offset, length)
+			return fd.handle.allocate(ctx, mode, offset, length)
 		})
 	}
 	return fd.FileDescriptionDefaultImpl.Allocate(ctx, mode, offset, length)
@@ -207,7 +233,7 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	}
 
 	bufN := int64(0)
-	if atomic.LoadUint32(&fd.haveBuf) != 0 {
+	if fd.haveBuf.Load() != 0 {
 		var err error
 		fd.bufMu.Lock()
 		if len(fd.buf) != 0 {
@@ -216,7 +242,7 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 			dst = dst.DropFirst(n)
 			fd.buf = fd.buf[n:]
 			if len(fd.buf) == 0 {
-				atomic.StoreUint32(&fd.haveBuf, 0)
+				fd.haveBuf.Store(0)
 				fd.buf = nil
 			}
 			bufN = int64(n)
@@ -230,23 +256,13 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		}
 	}
 
-	// Going through dst.CopyOutFrom() would hold MM locks around file
-	// operations of unknown duration. For regularFileFD, doing so is necessary
-	// to support mmap due to lock ordering; MM locks precede dentry.dataMu.
-	// That doesn't hold here since specialFileFD doesn't client-cache data.
-	// Just buffer the read instead.
-	buf := make([]byte, dst.NumBytes())
-	n, err := fd.handle.readToBlocksAt(ctx, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)), uint64(offset))
+	rw := getHandleReadWriter(ctx, &fd.handle, offset)
+	n, err := dst.CopyOutFrom(ctx, rw)
+	putHandleReadWriter(rw)
 	if linuxerr.Equals(linuxerr.EAGAIN, err) {
-		err = syserror.ErrWouldBlock
+		err = linuxerr.ErrWouldBlock
 	}
-	if n == 0 {
-		return bufN, err
-	}
-	if cp, cperr := dst.CopyOut(ctx, buf[:n]); cperr != nil {
-		return bufN + int64(cp), cperr
-	}
-	return bufN + int64(n), err
+	return bufN + n, err
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
@@ -288,7 +304,7 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		// size is updated. There is a possible race here if size is modified
 		// externally after metadata cache is updated.
 		if fd.vfsfd.StatusFlags()&linux.O_APPEND != 0 && !d.cachedMetadataAuthoritative() {
-			if err := d.updateFromGetattr(ctx); err != nil {
+			if err := d.updateMetadata(ctx); err != nil {
 				return 0, offset, err
 			}
 		}
@@ -300,7 +316,7 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		// Set offset to file size if the regular file was opened with O_APPEND.
 		if fd.vfsfd.StatusFlags()&linux.O_APPEND != 0 {
 			// Holding d.metadataMu is sufficient for reading d.size.
-			offset = int64(d.size)
+			offset = int64(d.size.RacyLoad())
 		}
 		limit, err := vfs.CheckLimit(ctx, offset, src.NumBytes())
 		if err != nil {
@@ -317,34 +333,49 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		}
 	}
 
-	// Do a buffered write. See rationale in PRead.
-	buf := make([]byte, src.NumBytes())
-	copied, copyErr := src.CopyIn(ctx, buf)
-	if copied == 0 && copyErr != nil {
-		// Only return the error if we didn't get any data.
-		return 0, offset, copyErr
+	// handleReadWriter always writes to the remote file. So O_DIRECT is
+	// effectively always set. Invalidate pages in d.mappings that have been
+	// written to.
+	pgstart := hostarch.PageRoundDown(uint64(offset))
+	pgend, ok := hostarch.PageRoundUp(uint64(offset + src.NumBytes()))
+	if !ok {
+		return 0, offset, linuxerr.EINVAL
 	}
-	n, err := fd.handle.writeFromBlocksAt(ctx, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:copied])), uint64(offset))
+	mr := memmap.MappableRange{pgstart, pgend}
+	d.mapsMu.Lock()
+	d.mappings.Invalidate(mr, memmap.InvalidateOpts{})
+	d.mapsMu.Unlock()
+
+	rw := getHandleReadWriter(ctx, &fd.handle, offset)
+	n, err := src.CopyInTo(ctx, rw)
+	putHandleReadWriter(rw)
+	if n > 0 && fd.vfsfd.StatusFlags()&(linux.O_DSYNC|linux.O_SYNC) != 0 {
+		// Note that if syncing the remote file fails, then we can't guarantee that
+		// any data was actually written with the semantics of O_DSYNC or
+		// O_SYNC, so we return zero bytes written. Compare Linux's
+		// mm/filemap.c:generic_file_write_iter() =>
+		// include/linux/fs.h:generic_write_sync().
+		if err := fd.sync(ctx, false /* forFilesystemSync */); err != nil {
+			return 0, offset, err
+		}
+	}
 	if linuxerr.Equals(linuxerr.EAGAIN, err) {
-		err = syserror.ErrWouldBlock
+		err = linuxerr.ErrWouldBlock
 	}
 	// Update offset if the offset is valid.
 	if offset >= 0 {
-		offset += int64(n)
+		offset += n
 	}
 	// Update file size for regular files.
 	if fd.isRegularFile {
 		// d.metadataMu is already locked at this point.
-		if uint64(offset) > d.size {
+		if uint64(offset) > d.size.RacyLoad() {
 			d.dataMu.Lock()
 			defer d.dataMu.Unlock()
-			atomic.StoreUint64(&d.size, uint64(offset))
+			d.size.Store(uint64(offset))
 		}
 	}
-	if err != nil {
-		return int64(n), offset, err
-	}
-	return int64(n), offset, copyErr
+	return int64(n), offset, err
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
@@ -385,21 +416,7 @@ func (fd *specialFileFD) sync(ctx context.Context, forFilesystemSync bool) error
 	fd.releaseMu.RLock()
 	defer fd.releaseMu.RUnlock()
 
-	if !fd.handle.isOpen() {
-		return nil
-	}
-	err := func() error {
-		// If we have a host FD, fsyncing it is likely to be faster than an fsync
-		// RPC.
-		if fd.handle.fd >= 0 {
-			ctx.UninterruptibleSleepStart(false)
-			err := unix.Fsync(int(fd.handle.fd))
-			ctx.UninterruptibleSleepFinish(false)
-			return err
-		}
-		return fd.handle.file.fsync(ctx)
-	}()
-	if err != nil {
+	if err := fd.handle.sync(ctx); err != nil {
 		if !forFilesystemSync {
 			return err
 		}
@@ -411,4 +428,110 @@ func (fd *specialFileFD) sync(ctx context.Context, forFilesystemSync bool) error
 		ctx.Debugf("gofer.specialFileFD.sync: syncing non-writable or non-regular-file FD failed: %v", err)
 	}
 	return nil
+}
+
+// ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
+func (fd *specialFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
+	if fd.handle.fd < 0 || fd.filesystem().opts.forcePageCache {
+		return linuxerr.ENODEV
+	}
+	// After this point, fd may be used as a memmap.Mappable and memmap.File.
+	fd.hostFileMapperInitOnce.Do(fd.hostFileMapper.Init)
+	return vfs.GenericConfigureMMap(&fd.vfsfd, fd, opts)
+}
+
+// AddMapping implements memmap.Mappable.AddMapping.
+func (fd *specialFileFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	d := fd.dentry()
+	d.mapsMu.Lock()
+	defer d.mapsMu.Unlock()
+	d.mappings.AddMapping(ms, ar, offset, writable)
+	fd.hostFileMapper.IncRefOn(memmap.MappableRange{offset, offset + uint64(ar.Length())})
+	return nil
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (fd *specialFileFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+	d := fd.dentry()
+	d.mapsMu.Lock()
+	defer d.mapsMu.Unlock()
+	d.mappings.RemoveMapping(ms, ar, offset, writable)
+	fd.hostFileMapper.DecRefOn(memmap.MappableRange{offset, offset + uint64(ar.Length())})
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (fd *specialFileFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return fd.AddMapping(ctx, ms, dstAR, offset, writable)
+}
+
+// Translate implements memmap.Mappable.Translate.
+func (fd *specialFileFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	mr := optional
+	if fd.filesystem().opts.limitHostFDTranslation {
+		mr = maxFillRange(required, optional)
+	}
+	return []memmap.Translation{
+		{
+			Source: mr,
+			File:   fd,
+			Offset: mr.Start,
+			Perms:  hostarch.AnyAccess,
+		},
+	}, nil
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+func (fd *specialFileFD) InvalidateUnsavable(ctx context.Context) error {
+	d := fd.dentry()
+	d.mapsMu.Lock()
+	defer d.mapsMu.Unlock()
+	d.mappings.InvalidateAll(memmap.InvalidateOpts{})
+	return nil
+}
+
+// IncRef implements memmap.File.IncRef.
+func (fd *specialFileFD) IncRef(fr memmap.FileRange, memCgID uint32) {
+	fd.fileRefsMu.Lock()
+	defer fd.fileRefsMu.Unlock()
+	fd.fileRefs.IncRefAndAccount(fr, memCgID)
+}
+
+// DecRef implements memmap.File.DecRef.
+func (fd *specialFileFD) DecRef(fr memmap.FileRange) {
+	fd.fileRefsMu.Lock()
+	defer fd.fileRefsMu.Unlock()
+	fd.fileRefs.DecRefAndAccount(fr)
+}
+
+// MapInternal implements memmap.File.MapInternal.
+func (fd *specialFileFD) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (safemem.BlockSeq, error) {
+	fd.requireHostFD()
+	return fd.hostFileMapper.MapInternal(fr, int(fd.handle.fd), at.Write)
+}
+
+// DataFD implements memmap.File.DataFD.
+func (fd *specialFileFD) DataFD(fr memmap.FileRange) (int, error) {
+	return fd.FD(), nil
+}
+
+// FD implements memmap.File.FD.
+func (fd *specialFileFD) FD() int {
+	fd.requireHostFD()
+	return int(fd.handle.fd)
+}
+
+func (fd *specialFileFD) requireHostFD() {
+	if fd.handle.fd < 0 {
+		// This is possible if fd was successfully mmapped before saving, then
+		// was restored without a host FD. This is unrecoverable: without a
+		// host FD, we can't mmap this file post-restore.
+		panic("gofer.specialFileFD can no longer be memory-mapped without a host FD")
+	}
+}
+
+func (fd *specialFileFD) updateMetadata(ctx context.Context) error {
+	d := fd.dentry()
+	d.metadataMu.Lock()
+	defer d.metadataMu.Unlock()
+	return d.updateMetadataLocked(ctx, fd.handle)
 }

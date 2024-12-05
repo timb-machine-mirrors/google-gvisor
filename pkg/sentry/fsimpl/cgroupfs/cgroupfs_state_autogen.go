@@ -3,6 +3,8 @@
 package cgroupfs
 
 import (
+	"context"
+
 	"gvisor.dev/gvisor/pkg/state"
 )
 
@@ -14,6 +16,7 @@ func (c *controllerCommon) StateFields() []string {
 	return []string{
 		"ty",
 		"fs",
+		"parent",
 	}
 }
 
@@ -24,14 +27,16 @@ func (c *controllerCommon) StateSave(stateSinkObject state.Sink) {
 	c.beforeSave()
 	stateSinkObject.Save(0, &c.ty)
 	stateSinkObject.Save(1, &c.fs)
+	stateSinkObject.Save(2, &c.parent)
 }
 
-func (c *controllerCommon) afterLoad() {}
+func (c *controllerCommon) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (c *controllerCommon) StateLoad(stateSourceObject state.Source) {
+func (c *controllerCommon) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &c.ty)
 	stateSourceObject.Load(1, &c.fs)
+	stateSourceObject.Load(2, &c.parent)
 }
 
 func (c *cgroupInode) StateTypeName() string {
@@ -41,7 +46,8 @@ func (c *cgroupInode) StateTypeName() string {
 func (c *cgroupInode) StateFields() []string {
 	return []string{
 		"dir",
-		"fs",
+		"id",
+		"controllers",
 		"ts",
 	}
 }
@@ -52,17 +58,19 @@ func (c *cgroupInode) beforeSave() {}
 func (c *cgroupInode) StateSave(stateSinkObject state.Sink) {
 	c.beforeSave()
 	stateSinkObject.Save(0, &c.dir)
-	stateSinkObject.Save(1, &c.fs)
-	stateSinkObject.Save(2, &c.ts)
+	stateSinkObject.Save(1, &c.id)
+	stateSinkObject.Save(2, &c.controllers)
+	stateSinkObject.Save(3, &c.ts)
 }
 
-func (c *cgroupInode) afterLoad() {}
+func (c *cgroupInode) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (c *cgroupInode) StateLoad(stateSourceObject state.Source) {
+func (c *cgroupInode) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &c.dir)
-	stateSourceObject.Load(1, &c.fs)
-	stateSourceObject.Load(2, &c.ts)
+	stateSourceObject.Load(1, &c.id)
+	stateSourceObject.Load(2, &c.controllers)
+	stateSourceObject.Load(3, &c.ts)
 }
 
 func (d *cgroupProcsData) StateTypeName() string {
@@ -83,10 +91,10 @@ func (d *cgroupProcsData) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &d.cgroupInode)
 }
 
-func (d *cgroupProcsData) afterLoad() {}
+func (d *cgroupProcsData) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (d *cgroupProcsData) StateLoad(stateSourceObject state.Source) {
+func (d *cgroupProcsData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.cgroupInode)
 }
 
@@ -108,10 +116,10 @@ func (d *tasksData) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &d.cgroupInode)
 }
 
-func (d *tasksData) afterLoad() {}
+func (d *tasksData) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (d *tasksData) StateLoad(stateSourceObject state.Source) {
+func (d *tasksData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.cgroupInode)
 }
 
@@ -130,10 +138,50 @@ func (fsType *FilesystemType) StateSave(stateSinkObject state.Sink) {
 	fsType.beforeSave()
 }
 
-func (fsType *FilesystemType) afterLoad() {}
+func (fsType *FilesystemType) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (fsType *FilesystemType) StateLoad(stateSourceObject state.Source) {
+func (fsType *FilesystemType) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+}
+
+func (i *InitialCgroup) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.InitialCgroup"
+}
+
+func (i *InitialCgroup) StateFields() []string {
+	return []string{
+		"Path",
+		"SetOwner",
+		"UID",
+		"GID",
+		"SetMode",
+		"Mode",
+	}
+}
+
+func (i *InitialCgroup) beforeSave() {}
+
+// +checklocksignore
+func (i *InitialCgroup) StateSave(stateSinkObject state.Sink) {
+	i.beforeSave()
+	stateSinkObject.Save(0, &i.Path)
+	stateSinkObject.Save(1, &i.SetOwner)
+	stateSinkObject.Save(2, &i.UID)
+	stateSinkObject.Save(3, &i.GID)
+	stateSinkObject.Save(4, &i.SetMode)
+	stateSinkObject.Save(5, &i.Mode)
+}
+
+func (i *InitialCgroup) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (i *InitialCgroup) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &i.Path)
+	stateSourceObject.Load(1, &i.SetOwner)
+	stateSourceObject.Load(2, &i.UID)
+	stateSourceObject.Load(3, &i.GID)
+	stateSourceObject.Load(4, &i.SetMode)
+	stateSourceObject.Load(5, &i.Mode)
 }
 
 func (i *InternalData) StateTypeName() string {
@@ -143,6 +191,7 @@ func (i *InternalData) StateTypeName() string {
 func (i *InternalData) StateFields() []string {
 	return []string{
 		"DefaultControlValues",
+		"InitialCgroup",
 	}
 }
 
@@ -152,13 +201,15 @@ func (i *InternalData) beforeSave() {}
 func (i *InternalData) StateSave(stateSinkObject state.Sink) {
 	i.beforeSave()
 	stateSinkObject.Save(0, &i.DefaultControlValues)
+	stateSinkObject.Save(1, &i.InitialCgroup)
 }
 
-func (i *InternalData) afterLoad() {}
+func (i *InternalData) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (i *InternalData) StateLoad(stateSourceObject state.Source) {
+func (i *InternalData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &i.DefaultControlValues)
+	stateSourceObject.Load(1, &i.InitialCgroup)
 }
 
 func (fs *filesystem) StateTypeName() string {
@@ -170,10 +221,12 @@ func (fs *filesystem) StateFields() []string {
 		"Filesystem",
 		"devMinor",
 		"hierarchyID",
+		"hierarchyName",
 		"controllers",
 		"kcontrollers",
 		"numCgroups",
 		"root",
+		"effectiveRoot",
 	}
 }
 
@@ -185,23 +238,27 @@ func (fs *filesystem) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &fs.Filesystem)
 	stateSinkObject.Save(1, &fs.devMinor)
 	stateSinkObject.Save(2, &fs.hierarchyID)
-	stateSinkObject.Save(3, &fs.controllers)
-	stateSinkObject.Save(4, &fs.kcontrollers)
-	stateSinkObject.Save(5, &fs.numCgroups)
-	stateSinkObject.Save(6, &fs.root)
+	stateSinkObject.Save(3, &fs.hierarchyName)
+	stateSinkObject.Save(4, &fs.controllers)
+	stateSinkObject.Save(5, &fs.kcontrollers)
+	stateSinkObject.Save(6, &fs.numCgroups)
+	stateSinkObject.Save(7, &fs.root)
+	stateSinkObject.Save(8, &fs.effectiveRoot)
 }
 
-func (fs *filesystem) afterLoad() {}
+func (fs *filesystem) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (fs *filesystem) StateLoad(stateSourceObject state.Source) {
+func (fs *filesystem) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &fs.Filesystem)
 	stateSourceObject.Load(1, &fs.devMinor)
 	stateSourceObject.Load(2, &fs.hierarchyID)
-	stateSourceObject.Load(3, &fs.controllers)
-	stateSourceObject.Load(4, &fs.kcontrollers)
-	stateSourceObject.Load(5, &fs.numCgroups)
-	stateSourceObject.Load(6, &fs.root)
+	stateSourceObject.Load(3, &fs.hierarchyName)
+	stateSourceObject.Load(4, &fs.controllers)
+	stateSourceObject.Load(5, &fs.kcontrollers)
+	stateSourceObject.Load(6, &fs.numCgroups)
+	stateSourceObject.Load(7, &fs.root)
+	stateSourceObject.Load(8, &fs.effectiveRoot)
 }
 
 func (i *implStatFS) StateTypeName() string {
@@ -219,10 +276,10 @@ func (i *implStatFS) StateSave(stateSinkObject state.Sink) {
 	i.beforeSave()
 }
 
-func (i *implStatFS) afterLoad() {}
+func (i *implStatFS) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (i *implStatFS) StateLoad(stateSourceObject state.Source) {
+func (i *implStatFS) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 }
 
 func (d *dir) StateTypeName() string {
@@ -231,14 +288,18 @@ func (d *dir) StateTypeName() string {
 
 func (d *dir) StateFields() []string {
 	return []string{
-		"dirRefs",
 		"InodeAlwaysValid",
 		"InodeAttrs",
-		"InodeNotSymlink",
 		"InodeDirectoryNoNewChildren",
+		"InodeNoopRefCount",
+		"InodeNotAnonymous",
+		"InodeNotSymlink",
+		"InodeWatches",
 		"OrderedChildren",
 		"implStatFS",
 		"locks",
+		"fs",
+		"cgi",
 	}
 }
 
@@ -247,81 +308,123 @@ func (d *dir) beforeSave() {}
 // +checklocksignore
 func (d *dir) StateSave(stateSinkObject state.Sink) {
 	d.beforeSave()
-	stateSinkObject.Save(0, &d.dirRefs)
-	stateSinkObject.Save(1, &d.InodeAlwaysValid)
-	stateSinkObject.Save(2, &d.InodeAttrs)
-	stateSinkObject.Save(3, &d.InodeNotSymlink)
-	stateSinkObject.Save(4, &d.InodeDirectoryNoNewChildren)
-	stateSinkObject.Save(5, &d.OrderedChildren)
-	stateSinkObject.Save(6, &d.implStatFS)
-	stateSinkObject.Save(7, &d.locks)
+	stateSinkObject.Save(0, &d.InodeAlwaysValid)
+	stateSinkObject.Save(1, &d.InodeAttrs)
+	stateSinkObject.Save(2, &d.InodeDirectoryNoNewChildren)
+	stateSinkObject.Save(3, &d.InodeNoopRefCount)
+	stateSinkObject.Save(4, &d.InodeNotAnonymous)
+	stateSinkObject.Save(5, &d.InodeNotSymlink)
+	stateSinkObject.Save(6, &d.InodeWatches)
+	stateSinkObject.Save(7, &d.OrderedChildren)
+	stateSinkObject.Save(8, &d.implStatFS)
+	stateSinkObject.Save(9, &d.locks)
+	stateSinkObject.Save(10, &d.fs)
+	stateSinkObject.Save(11, &d.cgi)
 }
 
-func (d *dir) afterLoad() {}
+func (d *dir) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (d *dir) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &d.dirRefs)
-	stateSourceObject.Load(1, &d.InodeAlwaysValid)
-	stateSourceObject.Load(2, &d.InodeAttrs)
-	stateSourceObject.Load(3, &d.InodeNotSymlink)
-	stateSourceObject.Load(4, &d.InodeDirectoryNoNewChildren)
-	stateSourceObject.Load(5, &d.OrderedChildren)
-	stateSourceObject.Load(6, &d.implStatFS)
-	stateSourceObject.Load(7, &d.locks)
+func (d *dir) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.InodeAlwaysValid)
+	stateSourceObject.Load(1, &d.InodeAttrs)
+	stateSourceObject.Load(2, &d.InodeDirectoryNoNewChildren)
+	stateSourceObject.Load(3, &d.InodeNoopRefCount)
+	stateSourceObject.Load(4, &d.InodeNotAnonymous)
+	stateSourceObject.Load(5, &d.InodeNotSymlink)
+	stateSourceObject.Load(6, &d.InodeWatches)
+	stateSourceObject.Load(7, &d.OrderedChildren)
+	stateSourceObject.Load(8, &d.implStatFS)
+	stateSourceObject.Load(9, &d.locks)
+	stateSourceObject.Load(10, &d.fs)
+	stateSourceObject.Load(11, &d.cgi)
 }
 
-func (c *controllerFile) StateTypeName() string {
+func (f *controllerFile) StateTypeName() string {
 	return "pkg/sentry/fsimpl/cgroupfs.controllerFile"
 }
 
-func (c *controllerFile) StateFields() []string {
+func (f *controllerFile) StateFields() []string {
 	return []string{
 		"DynamicBytesFile",
+		"implStatFS",
+		"allowBackgroundAccess",
 	}
 }
 
-func (c *controllerFile) beforeSave() {}
+func (f *controllerFile) beforeSave() {}
 
 // +checklocksignore
-func (c *controllerFile) StateSave(stateSinkObject state.Sink) {
-	c.beforeSave()
-	stateSinkObject.Save(0, &c.DynamicBytesFile)
+func (f *controllerFile) StateSave(stateSinkObject state.Sink) {
+	f.beforeSave()
+	stateSinkObject.Save(0, &f.DynamicBytesFile)
+	stateSinkObject.Save(1, &f.implStatFS)
+	stateSinkObject.Save(2, &f.allowBackgroundAccess)
 }
 
-func (c *controllerFile) afterLoad() {}
+func (f *controllerFile) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (c *controllerFile) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &c.DynamicBytesFile)
+func (f *controllerFile) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &f.DynamicBytesFile)
+	stateSourceObject.Load(1, &f.implStatFS)
+	stateSourceObject.Load(2, &f.allowBackgroundAccess)
 }
 
-func (s *staticControllerFile) StateTypeName() string {
+func (f *staticControllerFile) StateTypeName() string {
 	return "pkg/sentry/fsimpl/cgroupfs.staticControllerFile"
 }
 
-func (s *staticControllerFile) StateFields() []string {
+func (f *staticControllerFile) StateFields() []string {
 	return []string{
 		"DynamicBytesFile",
 		"StaticData",
 	}
 }
 
-func (s *staticControllerFile) beforeSave() {}
+func (f *staticControllerFile) beforeSave() {}
 
 // +checklocksignore
-func (s *staticControllerFile) StateSave(stateSinkObject state.Sink) {
-	s.beforeSave()
-	stateSinkObject.Save(0, &s.DynamicBytesFile)
-	stateSinkObject.Save(1, &s.StaticData)
+func (f *staticControllerFile) StateSave(stateSinkObject state.Sink) {
+	f.beforeSave()
+	stateSinkObject.Save(0, &f.DynamicBytesFile)
+	stateSinkObject.Save(1, &f.StaticData)
 }
 
-func (s *staticControllerFile) afterLoad() {}
+func (f *staticControllerFile) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (s *staticControllerFile) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &s.DynamicBytesFile)
-	stateSourceObject.Load(1, &s.StaticData)
+func (f *staticControllerFile) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &f.DynamicBytesFile)
+	stateSourceObject.Load(1, &f.StaticData)
+}
+
+func (f *stubControllerFile) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.stubControllerFile"
+}
+
+func (f *stubControllerFile) StateFields() []string {
+	return []string{
+		"controllerFile",
+		"data",
+	}
+}
+
+func (f *stubControllerFile) beforeSave() {}
+
+// +checklocksignore
+func (f *stubControllerFile) StateSave(stateSinkObject state.Sink) {
+	f.beforeSave()
+	stateSinkObject.Save(0, &f.controllerFile)
+	stateSinkObject.Save(1, &f.data)
+}
+
+func (f *stubControllerFile) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (f *stubControllerFile) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &f.controllerFile)
+	stateSourceObject.Load(1, &f.data)
 }
 
 func (c *cpuController) StateTypeName() string {
@@ -331,6 +434,8 @@ func (c *cpuController) StateTypeName() string {
 func (c *cpuController) StateFields() []string {
 	return []string{
 		"controllerCommon",
+		"controllerStateless",
+		"controllerNoResource",
 		"cfsPeriod",
 		"cfsQuota",
 		"shares",
@@ -343,19 +448,23 @@ func (c *cpuController) beforeSave() {}
 func (c *cpuController) StateSave(stateSinkObject state.Sink) {
 	c.beforeSave()
 	stateSinkObject.Save(0, &c.controllerCommon)
-	stateSinkObject.Save(1, &c.cfsPeriod)
-	stateSinkObject.Save(2, &c.cfsQuota)
-	stateSinkObject.Save(3, &c.shares)
+	stateSinkObject.Save(1, &c.controllerStateless)
+	stateSinkObject.Save(2, &c.controllerNoResource)
+	stateSinkObject.Save(3, &c.cfsPeriod)
+	stateSinkObject.Save(4, &c.cfsQuota)
+	stateSinkObject.Save(5, &c.shares)
 }
 
-func (c *cpuController) afterLoad() {}
+func (c *cpuController) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (c *cpuController) StateLoad(stateSourceObject state.Source) {
+func (c *cpuController) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &c.controllerCommon)
-	stateSourceObject.Load(1, &c.cfsPeriod)
-	stateSourceObject.Load(2, &c.cfsQuota)
-	stateSourceObject.Load(3, &c.shares)
+	stateSourceObject.Load(1, &c.controllerStateless)
+	stateSourceObject.Load(2, &c.controllerNoResource)
+	stateSourceObject.Load(3, &c.cfsPeriod)
+	stateSourceObject.Load(4, &c.cfsQuota)
+	stateSourceObject.Load(5, &c.shares)
 }
 
 func (c *cpuacctController) StateTypeName() string {
@@ -365,6 +474,9 @@ func (c *cpuacctController) StateTypeName() string {
 func (c *cpuacctController) StateFields() []string {
 	return []string{
 		"controllerCommon",
+		"controllerNoResource",
+		"taskCommittedCharges",
+		"usage",
 	}
 }
 
@@ -374,13 +486,19 @@ func (c *cpuacctController) beforeSave() {}
 func (c *cpuacctController) StateSave(stateSinkObject state.Sink) {
 	c.beforeSave()
 	stateSinkObject.Save(0, &c.controllerCommon)
+	stateSinkObject.Save(1, &c.controllerNoResource)
+	stateSinkObject.Save(2, &c.taskCommittedCharges)
+	stateSinkObject.Save(3, &c.usage)
 }
 
-func (c *cpuacctController) afterLoad() {}
+func (c *cpuacctController) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (c *cpuacctController) StateLoad(stateSourceObject state.Source) {
+func (c *cpuacctController) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &c.controllerCommon)
+	stateSourceObject.Load(1, &c.controllerNoResource)
+	stateSourceObject.Load(2, &c.taskCommittedCharges)
+	stateSourceObject.Load(3, &c.usage)
 }
 
 func (c *cpuacctCgroup) StateTypeName() string {
@@ -401,10 +519,10 @@ func (c *cpuacctCgroup) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &c.cgroupInode)
 }
 
-func (c *cpuacctCgroup) afterLoad() {}
+func (c *cpuacctCgroup) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (c *cpuacctCgroup) StateLoad(stateSourceObject state.Source) {
+func (c *cpuacctCgroup) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &c.cgroupInode)
 }
 
@@ -426,10 +544,10 @@ func (d *cpuacctStatData) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &d.cpuacctCgroup)
 }
 
-func (d *cpuacctStatData) afterLoad() {}
+func (d *cpuacctStatData) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (d *cpuacctStatData) StateLoad(stateSourceObject state.Source) {
+func (d *cpuacctStatData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.cpuacctCgroup)
 }
 
@@ -451,10 +569,10 @@ func (d *cpuacctUsageData) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &d.cpuacctCgroup)
 }
 
-func (d *cpuacctUsageData) afterLoad() {}
+func (d *cpuacctUsageData) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (d *cpuacctUsageData) StateLoad(stateSourceObject state.Source) {
+func (d *cpuacctUsageData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.cpuacctCgroup)
 }
 
@@ -476,10 +594,10 @@ func (d *cpuacctUsageUserData) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &d.cpuacctCgroup)
 }
 
-func (d *cpuacctUsageUserData) afterLoad() {}
+func (d *cpuacctUsageUserData) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (d *cpuacctUsageUserData) StateLoad(stateSourceObject state.Source) {
+func (d *cpuacctUsageUserData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.cpuacctCgroup)
 }
 
@@ -501,10 +619,10 @@ func (d *cpuacctUsageSysData) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &d.cpuacctCgroup)
 }
 
-func (d *cpuacctUsageSysData) afterLoad() {}
+func (d *cpuacctUsageSysData) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (d *cpuacctUsageSysData) StateLoad(stateSourceObject state.Source) {
+func (d *cpuacctUsageSysData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.cpuacctCgroup)
 }
 
@@ -515,6 +633,12 @@ func (c *cpusetController) StateTypeName() string {
 func (c *cpusetController) StateFields() []string {
 	return []string{
 		"controllerCommon",
+		"controllerStateless",
+		"controllerNoResource",
+		"maxCpus",
+		"maxMems",
+		"cpus",
+		"mems",
 	}
 }
 
@@ -524,13 +648,218 @@ func (c *cpusetController) beforeSave() {}
 func (c *cpusetController) StateSave(stateSinkObject state.Sink) {
 	c.beforeSave()
 	stateSinkObject.Save(0, &c.controllerCommon)
+	stateSinkObject.Save(1, &c.controllerStateless)
+	stateSinkObject.Save(2, &c.controllerNoResource)
+	stateSinkObject.Save(3, &c.maxCpus)
+	stateSinkObject.Save(4, &c.maxMems)
+	stateSinkObject.Save(5, &c.cpus)
+	stateSinkObject.Save(6, &c.mems)
 }
 
-func (c *cpusetController) afterLoad() {}
+func (c *cpusetController) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (c *cpusetController) StateLoad(stateSourceObject state.Source) {
+func (c *cpusetController) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &c.controllerCommon)
+	stateSourceObject.Load(1, &c.controllerStateless)
+	stateSourceObject.Load(2, &c.controllerNoResource)
+	stateSourceObject.Load(3, &c.maxCpus)
+	stateSourceObject.Load(4, &c.maxMems)
+	stateSourceObject.Load(5, &c.cpus)
+	stateSourceObject.Load(6, &c.mems)
+}
+
+func (d *cpusData) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.cpusData"
+}
+
+func (d *cpusData) StateFields() []string {
+	return []string{
+		"c",
+	}
+}
+
+func (d *cpusData) beforeSave() {}
+
+// +checklocksignore
+func (d *cpusData) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.c)
+}
+
+func (d *cpusData) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (d *cpusData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.c)
+}
+
+func (d *memsData) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.memsData"
+}
+
+func (d *memsData) StateFields() []string {
+	return []string{
+		"c",
+	}
+}
+
+func (d *memsData) beforeSave() {}
+
+// +checklocksignore
+func (d *memsData) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.c)
+}
+
+func (d *memsData) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (d *memsData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.c)
+}
+
+func (d *deviceID) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.deviceID"
+}
+
+func (d *deviceID) StateFields() []string {
+	return []string{
+		"controllerType",
+		"major",
+		"minor",
+	}
+}
+
+func (d *deviceID) beforeSave() {}
+
+// +checklocksignore
+func (d *deviceID) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.controllerType)
+	stateSinkObject.Save(1, &d.major)
+	stateSinkObject.Save(2, &d.minor)
+}
+
+func (d *deviceID) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (d *deviceID) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.controllerType)
+	stateSourceObject.Load(1, &d.major)
+	stateSourceObject.Load(2, &d.minor)
+}
+
+func (c *devicesController) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.devicesController"
+}
+
+func (c *devicesController) StateFields() []string {
+	return []string{
+		"controllerCommon",
+		"controllerStateless",
+		"controllerNoResource",
+		"defaultAllow",
+		"deviceRules",
+	}
+}
+
+func (c *devicesController) beforeSave() {}
+
+// +checklocksignore
+func (c *devicesController) StateSave(stateSinkObject state.Sink) {
+	c.beforeSave()
+	stateSinkObject.Save(0, &c.controllerCommon)
+	stateSinkObject.Save(1, &c.controllerStateless)
+	stateSinkObject.Save(2, &c.controllerNoResource)
+	stateSinkObject.Save(3, &c.defaultAllow)
+	stateSinkObject.Save(4, &c.deviceRules)
+}
+
+func (c *devicesController) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (c *devicesController) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &c.controllerCommon)
+	stateSourceObject.Load(1, &c.controllerStateless)
+	stateSourceObject.Load(2, &c.controllerNoResource)
+	stateSourceObject.Load(3, &c.defaultAllow)
+	stateSourceObject.Load(4, &c.deviceRules)
+}
+
+func (d *allowedDevicesData) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.allowedDevicesData"
+}
+
+func (d *allowedDevicesData) StateFields() []string {
+	return []string{
+		"c",
+	}
+}
+
+func (d *allowedDevicesData) beforeSave() {}
+
+// +checklocksignore
+func (d *allowedDevicesData) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.c)
+}
+
+func (d *allowedDevicesData) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (d *allowedDevicesData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.c)
+}
+
+func (d *deniedDevicesData) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.deniedDevicesData"
+}
+
+func (d *deniedDevicesData) StateFields() []string {
+	return []string{
+		"c",
+	}
+}
+
+func (d *deniedDevicesData) beforeSave() {}
+
+// +checklocksignore
+func (d *deniedDevicesData) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.c)
+}
+
+func (d *deniedDevicesData) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (d *deniedDevicesData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.c)
+}
+
+func (d *controlledDevicesData) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.controlledDevicesData"
+}
+
+func (d *controlledDevicesData) StateFields() []string {
+	return []string{
+		"c",
+	}
+}
+
+func (d *controlledDevicesData) beforeSave() {}
+
+// +checklocksignore
+func (d *controlledDevicesData) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.c)
+}
+
+func (d *controlledDevicesData) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (d *controlledDevicesData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.c)
 }
 
 func (r *dirRefs) StateTypeName() string {
@@ -552,9 +881,9 @@ func (r *dirRefs) StateSave(stateSinkObject state.Sink) {
 }
 
 // +checklocksignore
-func (r *dirRefs) StateLoad(stateSourceObject state.Source) {
+func (r *dirRefs) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.refCount)
-	stateSourceObject.AfterLoad(r.afterLoad)
+	stateSourceObject.AfterLoad(func() { r.afterLoad(ctx) })
 }
 
 func (c *jobController) StateTypeName() string {
@@ -564,6 +893,8 @@ func (c *jobController) StateTypeName() string {
 func (c *jobController) StateFields() []string {
 	return []string{
 		"controllerCommon",
+		"controllerStateless",
+		"controllerNoResource",
 		"id",
 	}
 }
@@ -574,40 +905,19 @@ func (c *jobController) beforeSave() {}
 func (c *jobController) StateSave(stateSinkObject state.Sink) {
 	c.beforeSave()
 	stateSinkObject.Save(0, &c.controllerCommon)
-	stateSinkObject.Save(1, &c.id)
+	stateSinkObject.Save(1, &c.controllerStateless)
+	stateSinkObject.Save(2, &c.controllerNoResource)
+	stateSinkObject.Save(3, &c.id)
 }
 
-func (c *jobController) afterLoad() {}
+func (c *jobController) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (c *jobController) StateLoad(stateSourceObject state.Source) {
+func (c *jobController) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &c.controllerCommon)
-	stateSourceObject.Load(1, &c.id)
-}
-
-func (d *jobIDData) StateTypeName() string {
-	return "pkg/sentry/fsimpl/cgroupfs.jobIDData"
-}
-
-func (d *jobIDData) StateFields() []string {
-	return []string{
-		"c",
-	}
-}
-
-func (d *jobIDData) beforeSave() {}
-
-// +checklocksignore
-func (d *jobIDData) StateSave(stateSinkObject state.Sink) {
-	d.beforeSave()
-	stateSinkObject.Save(0, &d.c)
-}
-
-func (d *jobIDData) afterLoad() {}
-
-// +checklocksignore
-func (d *jobIDData) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &d.c)
+	stateSourceObject.Load(1, &c.controllerStateless)
+	stateSourceObject.Load(2, &c.controllerNoResource)
+	stateSourceObject.Load(3, &c.id)
 }
 
 func (c *memoryController) StateTypeName() string {
@@ -617,7 +927,12 @@ func (c *memoryController) StateTypeName() string {
 func (c *memoryController) StateFields() []string {
 	return []string{
 		"controllerCommon",
+		"controllerNoResource",
 		"limitBytes",
+		"softLimitBytes",
+		"moveChargeAtImmigrate",
+		"pressureLevel",
+		"memCg",
 	}
 }
 
@@ -627,15 +942,50 @@ func (c *memoryController) beforeSave() {}
 func (c *memoryController) StateSave(stateSinkObject state.Sink) {
 	c.beforeSave()
 	stateSinkObject.Save(0, &c.controllerCommon)
-	stateSinkObject.Save(1, &c.limitBytes)
+	stateSinkObject.Save(1, &c.controllerNoResource)
+	stateSinkObject.Save(2, &c.limitBytes)
+	stateSinkObject.Save(3, &c.softLimitBytes)
+	stateSinkObject.Save(4, &c.moveChargeAtImmigrate)
+	stateSinkObject.Save(5, &c.pressureLevel)
+	stateSinkObject.Save(6, &c.memCg)
 }
 
-func (c *memoryController) afterLoad() {}
+func (c *memoryController) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (c *memoryController) StateLoad(stateSourceObject state.Source) {
+func (c *memoryController) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &c.controllerCommon)
-	stateSourceObject.Load(1, &c.limitBytes)
+	stateSourceObject.Load(1, &c.controllerNoResource)
+	stateSourceObject.Load(2, &c.limitBytes)
+	stateSourceObject.Load(3, &c.softLimitBytes)
+	stateSourceObject.Load(4, &c.moveChargeAtImmigrate)
+	stateSourceObject.Load(5, &c.pressureLevel)
+	stateSourceObject.Load(6, &c.memCg)
+}
+
+func (memCg *memoryCgroup) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.memoryCgroup"
+}
+
+func (memCg *memoryCgroup) StateFields() []string {
+	return []string{
+		"cgroupInode",
+	}
+}
+
+func (memCg *memoryCgroup) beforeSave() {}
+
+// +checklocksignore
+func (memCg *memoryCgroup) StateSave(stateSinkObject state.Sink) {
+	memCg.beforeSave()
+	stateSinkObject.Save(0, &memCg.cgroupInode)
+}
+
+func (memCg *memoryCgroup) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (memCg *memoryCgroup) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &memCg.cgroupInode)
 }
 
 func (d *memoryUsageInBytesData) StateTypeName() string {
@@ -643,7 +993,9 @@ func (d *memoryUsageInBytesData) StateTypeName() string {
 }
 
 func (d *memoryUsageInBytesData) StateFields() []string {
-	return []string{}
+	return []string{
+		"memCg",
+	}
 }
 
 func (d *memoryUsageInBytesData) beforeSave() {}
@@ -651,12 +1003,104 @@ func (d *memoryUsageInBytesData) beforeSave() {}
 // +checklocksignore
 func (d *memoryUsageInBytesData) StateSave(stateSinkObject state.Sink) {
 	d.beforeSave()
+	stateSinkObject.Save(0, &d.memCg)
 }
 
-func (d *memoryUsageInBytesData) afterLoad() {}
+func (d *memoryUsageInBytesData) afterLoad(context.Context) {}
 
 // +checklocksignore
-func (d *memoryUsageInBytesData) StateLoad(stateSourceObject state.Source) {
+func (d *memoryUsageInBytesData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.memCg)
+}
+
+func (c *pidsController) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.pidsController"
+}
+
+func (c *pidsController) StateFields() []string {
+	return []string{
+		"controllerCommon",
+		"isRoot",
+		"pendingTotal",
+		"pendingPool",
+		"committed",
+		"max",
+	}
+}
+
+func (c *pidsController) beforeSave() {}
+
+// +checklocksignore
+func (c *pidsController) StateSave(stateSinkObject state.Sink) {
+	c.beforeSave()
+	stateSinkObject.Save(0, &c.controllerCommon)
+	stateSinkObject.Save(1, &c.isRoot)
+	stateSinkObject.Save(2, &c.pendingTotal)
+	stateSinkObject.Save(3, &c.pendingPool)
+	stateSinkObject.Save(4, &c.committed)
+	stateSinkObject.Save(5, &c.max)
+}
+
+func (c *pidsController) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (c *pidsController) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &c.controllerCommon)
+	stateSourceObject.Load(1, &c.isRoot)
+	stateSourceObject.Load(2, &c.pendingTotal)
+	stateSourceObject.Load(3, &c.pendingPool)
+	stateSourceObject.Load(4, &c.committed)
+	stateSourceObject.Load(5, &c.max)
+}
+
+func (d *pidsCurrentData) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.pidsCurrentData"
+}
+
+func (d *pidsCurrentData) StateFields() []string {
+	return []string{
+		"c",
+	}
+}
+
+func (d *pidsCurrentData) beforeSave() {}
+
+// +checklocksignore
+func (d *pidsCurrentData) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.c)
+}
+
+func (d *pidsCurrentData) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (d *pidsCurrentData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.c)
+}
+
+func (d *pidsMaxData) StateTypeName() string {
+	return "pkg/sentry/fsimpl/cgroupfs.pidsMaxData"
+}
+
+func (d *pidsMaxData) StateFields() []string {
+	return []string{
+		"c",
+	}
+}
+
+func (d *pidsMaxData) beforeSave() {}
+
+// +checklocksignore
+func (d *pidsMaxData) StateSave(stateSinkObject state.Sink) {
+	d.beforeSave()
+	stateSinkObject.Save(0, &d.c)
+}
+
+func (d *pidsMaxData) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (d *pidsMaxData) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &d.c)
 }
 
 func init() {
@@ -665,12 +1109,14 @@ func init() {
 	state.Register((*cgroupProcsData)(nil))
 	state.Register((*tasksData)(nil))
 	state.Register((*FilesystemType)(nil))
+	state.Register((*InitialCgroup)(nil))
 	state.Register((*InternalData)(nil))
 	state.Register((*filesystem)(nil))
 	state.Register((*implStatFS)(nil))
 	state.Register((*dir)(nil))
 	state.Register((*controllerFile)(nil))
 	state.Register((*staticControllerFile)(nil))
+	state.Register((*stubControllerFile)(nil))
 	state.Register((*cpuController)(nil))
 	state.Register((*cpuacctController)(nil))
 	state.Register((*cpuacctCgroup)(nil))
@@ -679,9 +1125,19 @@ func init() {
 	state.Register((*cpuacctUsageUserData)(nil))
 	state.Register((*cpuacctUsageSysData)(nil))
 	state.Register((*cpusetController)(nil))
+	state.Register((*cpusData)(nil))
+	state.Register((*memsData)(nil))
+	state.Register((*deviceID)(nil))
+	state.Register((*devicesController)(nil))
+	state.Register((*allowedDevicesData)(nil))
+	state.Register((*deniedDevicesData)(nil))
+	state.Register((*controlledDevicesData)(nil))
 	state.Register((*dirRefs)(nil))
 	state.Register((*jobController)(nil))
-	state.Register((*jobIDData)(nil))
 	state.Register((*memoryController)(nil))
+	state.Register((*memoryCgroup)(nil))
 	state.Register((*memoryUsageInBytesData)(nil))
+	state.Register((*pidsController)(nil))
+	state.Register((*pidsCurrentData)(nil))
+	state.Register((*pidsMaxData)(nil))
 }

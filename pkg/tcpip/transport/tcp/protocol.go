@@ -16,15 +16,18 @@
 package tcp
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
 	"runtime"
 	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/header/parse"
+	"gvisor.dev/gvisor/pkg/tcpip/internal/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/raw"
@@ -49,10 +52,6 @@ const (
 	// MaxBufferSize is the largest size a receive/send buffer can grow to.
 	MaxBufferSize = 4 << 20 // 4MB
 
-	// MaxUnprocessedSegments is the maximum number of unprocessed segments
-	// that can be queued for a given endpoint.
-	MaxUnprocessedSegments = 300
-
 	// DefaultTCPLingerTimeout is the amount of time that sockets linger in
 	// FIN_WAIT_2 state before being marked closed.
 	DefaultTCPLingerTimeout = 60 * time.Second
@@ -68,6 +67,18 @@ const (
 	// DefaultSynRetries is the default value for the number of SYN retransmits
 	// before a connect is aborted.
 	DefaultSynRetries = 6
+
+	// DefaultKeepaliveIdle is the idle time for a connection before keep-alive
+	// probes are sent.
+	DefaultKeepaliveIdle = 2 * time.Hour
+
+	// DefaultKeepaliveInterval is the time between two successive keep-alive
+	// probes.
+	DefaultKeepaliveInterval = 75 * time.Second
+
+	// DefaultKeepaliveCount is the number of keep-alive probes that are sent
+	// before declaring the connection dead.
+	DefaultKeepaliveCount = 9
 )
 
 const (
@@ -75,10 +86,11 @@ const (
 	ccCubic = "cubic"
 )
 
+// +stateify savable
 type protocol struct {
 	stack *stack.Stack
 
-	mu                         sync.RWMutex
+	mu                         sync.RWMutex `state:"nosave"`
 	sackEnabled                bool
 	recovery                   tcpip.TCPRecovery
 	delayEnabled               bool
@@ -96,6 +108,16 @@ type protocol struct {
 	maxRetries                 uint32
 	synRetries                 uint8
 	dispatcher                 dispatcher
+
+	// probe, if not nil, will be invoked any time an endpoint receives a
+	// TCP segment.
+	//
+	// This is immutable after creation.
+	probe TCPProbeFunc `state:"nosave"`
+
+	// The following secrets are initialized once and stay unchanged after.
+	seqnumSecret   [16]byte
+	tsOffsetSecret [16]byte
 }
 
 // Number returns the tcp protocol number.
@@ -105,7 +127,7 @@ func (*protocol) Number() tcpip.TransportProtocolNumber {
 
 // NewEndpoint creates a new tcp endpoint.
 func (p *protocol) NewEndpoint(netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, tcpip.Error) {
-	return newEndpoint(p.stack, netProto, waiterQueue), nil
+	return newEndpoint(p.stack, p, netProto, waiterQueue), nil
 }
 
 // NewRawEndpoint creates a new raw TCP endpoint. Raw TCP sockets are currently
@@ -121,7 +143,7 @@ func (*protocol) MinimumPacketSize() int {
 
 // ParsePorts returns the source and destination ports stored in the given tcp
 // packet.
-func (*protocol) ParsePorts(v buffer.View) (src, dst uint16, err tcpip.Error) {
+func (*protocol) ParsePorts(v []byte) (src, dst uint16, err tcpip.Error) {
 	h := header.TCP(v)
 	return h.SourcePort(), h.DestinationPort(), nil
 }
@@ -142,29 +164,52 @@ func (p *protocol) QueuePacket(ep stack.TransportEndpoint, id stack.TransportEnd
 // particular, SYNs addressed to a non-existent connection are rejected by this
 // means."
 func (p *protocol) HandleUnknownDestinationPacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
-	s := newIncomingSegment(id, p.stack.Clock(), pkt)
-	defer s.decRef()
-
-	if !s.parse(pkt.RXTransportChecksumValidated) || !s.csumValid {
+	s, err := newIncomingSegment(id, p.stack.Clock(), pkt)
+	if err != nil {
+		return stack.UnknownDestinationPacketMalformed
+	}
+	defer s.DecRef()
+	if !s.csumValid {
 		return stack.UnknownDestinationPacketMalformed
 	}
 
 	if !s.flags.Contains(header.TCPFlagRst) {
-		replyWithReset(p.stack, s, stack.DefaultTOS, 0)
+		replyWithReset(p.stack, s, stack.DefaultTOS, tcpip.UseDefaultIPv4TTL, tcpip.UseDefaultIPv6HopLimit)
 	}
 
 	return stack.UnknownDestinationPacketHandled
 }
 
+func (p *protocol) tsOffset(src, dst tcpip.Address) tcp.TSOffset {
+	// Initialize a random tsOffset that will be added to the recentTS
+	// everytime the timestamp is sent when the Timestamp option is enabled.
+	//
+	// See https://tools.ietf.org/html/rfc7323#section-5.4 for details on
+	// why this is required.
+	h := sha256.New()
+
+	// Per hash.Hash.Writer:
+	//
+	// It never returns an error.
+	_, _ = h.Write(p.tsOffsetSecret[:])
+	_, _ = h.Write(src.AsSlice())
+	_, _ = h.Write(dst.AsSlice())
+	return tcp.NewTSOffset(binary.LittleEndian.Uint32(h.Sum(nil)[:4]))
+}
+
 // replyWithReset replies to the given segment with a reset segment.
 //
-// If the passed TTL is 0, then the route's default TTL will be used.
-func replyWithReset(st *stack.Stack, s *segment, tos, ttl uint8) tcpip.Error {
-	route, err := st.FindRoute(s.nicID, s.dstAddr, s.srcAddr, s.netProto, false /* multicastLoop */)
+// If the relevant TTL has its reset value (0 for ipv4TTL, -1 for ipv6HopLimit),
+// then the route's default TTL will be used.
+func replyWithReset(st *stack.Stack, s *segment, tos, ipv4TTL uint8, ipv6HopLimit int16) tcpip.Error {
+	net := s.pkt.Network()
+	route, err := st.FindRoute(s.pkt.NICID, net.DestinationAddress(), net.SourceAddress(), s.pkt.NetworkProtocolNumber, false /* multicastLoop */)
 	if err != nil {
 		return err
 	}
 	defer route.Release()
+
+	ttl := calculateTTL(route, ipv4TTL, ipv6HopLimit)
 
 	// Get the seqnum from the packet if the ack flag is set.
 	seq := seqnum.Value(0)
@@ -188,19 +233,27 @@ func replyWithReset(st *stack.Stack, s *segment, tos, ttl uint8) tcpip.Error {
 		ack = s.sequenceNumber.Add(s.logicalLen())
 	}
 
-	if ttl == 0 {
-		ttl = route.DefaultTTL()
+	var expOptVal uint16
+	if s.ep != nil {
+		expOptVal = s.ep.getExperimentOptionValue(route)
 	}
+	hdrSize := header.TCPMinimumSize + int(route.MaxHeaderLength())
+	if route.NetProto() == header.IPv6ProtocolNumber && expOptVal != 0 {
+		hdrSize += header.IPv6ExperimentHdrLength
+	}
+	p := stack.NewPacketBuffer(stack.PacketBufferOptions{ReserveHeaderBytes: hdrSize})
+	defer p.DecRef()
 
 	return sendTCP(route, tcpFields{
-		id:     s.id,
-		ttl:    ttl,
-		tos:    tos,
-		flags:  flags,
-		seq:    seq,
-		ack:    ack,
-		rcvWnd: 0,
-	}, buffer.VectorisedView{}, stack.GSO{}, nil /* PacketOwner */)
+		id:        s.id,
+		ttl:       ttl,
+		tos:       tos,
+		flags:     flags,
+		seq:       seq,
+		ack:       ack,
+		rcvWnd:    0,
+		expOptVal: expOptVal,
+	}, p, stack.GSO{}, nil /* PacketOwner */)
 }
 
 // SetOption implements stack.TransportProtocol.SetOption.
@@ -292,22 +345,26 @@ func (p *protocol) SetOption(option tcpip.SettableTransportProtocolOption) tcpip
 
 	case *tcpip.TCPMinRTOOption:
 		p.mu.Lock()
+		defer p.mu.Unlock()
 		if *v < 0 {
 			p.minRTO = MinRTO
+		} else if minRTO := time.Duration(*v); minRTO <= p.maxRTO {
+			p.minRTO = minRTO
 		} else {
-			p.minRTO = time.Duration(*v)
+			return &tcpip.ErrInvalidOptionValue{}
 		}
-		p.mu.Unlock()
 		return nil
 
 	case *tcpip.TCPMaxRTOOption:
 		p.mu.Lock()
+		defer p.mu.Unlock()
 		if *v < 0 {
 			p.maxRTO = MaxRTO
+		} else if maxRTO := time.Duration(*v); maxRTO >= p.minRTO {
+			p.maxRTO = maxRTO
 		} else {
-			p.maxRTO = time.Duration(*v)
+			return &tcpip.ErrInvalidOptionValue{}
 		}
-		p.mu.Unlock()
 		return nil
 
 	case *tcpip.TCPMaxRetriesOption:
@@ -323,7 +380,7 @@ func (p *protocol) SetOption(option tcpip.SettableTransportProtocolOption) tcpip
 		return nil
 
 	case *tcpip.TCPSynRetriesOption:
-		if *v < 1 || *v > 255 {
+		if *v < 1 {
 			return &tcpip.ErrInvalidOptionValue{}
 		}
 		p.mu.Lock()
@@ -440,6 +497,13 @@ func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) tcpip.Er
 	}
 }
 
+// SendBufferSize implements stack.SendBufSizeProto.
+func (p *protocol) SendBufferSize() tcpip.TCPSendBufferSizeRangeOption {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.sendBufferSize
+}
+
 // Close implements stack.TransportProtocol.Close.
 func (p *protocol) Close() {
 	p.dispatcher.close()
@@ -450,13 +514,61 @@ func (p *protocol) Wait() {
 	p.dispatcher.wait()
 }
 
+// Pause implements stack.TransportProtocol.Pause.
+func (p *protocol) Pause() {
+	p.dispatcher.pause()
+}
+
+// Resume implements stack.TransportProtocol.Resume.
+func (p *protocol) Resume() {
+	p.dispatcher.resume()
+}
+
+// Restore implements stack.TransportProtocol.Restore.
+func (p *protocol) Restore() {
+	p.dispatcher.start()
+}
+
 // Parse implements stack.TransportProtocol.Parse.
 func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
 	return parse.TCP(pkt)
 }
 
-// NewProtocol returns a TCP transport protocol.
+// NewProtocol returns a TCP transport protocol with Reno congestion control.
 func NewProtocol(s *stack.Stack) stack.TransportProtocol {
+	return newProtocol(s, ccReno, nil)
+}
+
+// NewProtocolProbe returns a TCP transport protocol with Reno congestion
+// control and the given probe.
+//
+// The probe will be invoked on every segment received by TCP endpoints. The
+// probe function is passed a copy of the TCP endpoint state before and after
+// processing of the segment.
+func NewProtocolProbe(probe TCPProbeFunc) func(*stack.Stack) stack.TransportProtocol {
+	return func(s *stack.Stack) stack.TransportProtocol {
+		return newProtocol(s, ccReno, probe)
+	}
+}
+
+// NewProtocolCUBIC returns a TCP transport protocol with CUBIC congestion
+// control.
+//
+// TODO(b/345835636): Remove this and make CUBIC the default across the board.
+func NewProtocolCUBIC(s *stack.Stack) stack.TransportProtocol {
+	return newProtocol(s, ccCubic, nil)
+}
+
+func newProtocol(s *stack.Stack, cc string, probe TCPProbeFunc) stack.TransportProtocol {
+	rng := s.SecureRNG()
+	var seqnumSecret [16]byte
+	var tsOffsetSecret [16]byte
+	if n, err := rng.Reader.Read(seqnumSecret[:]); err != nil || n != len(seqnumSecret) {
+		panic(fmt.Sprintf("Read() failed: %v", err))
+	}
+	if n, err := rng.Reader.Read(tsOffsetSecret[:]); err != nil || n != len(tsOffsetSecret) {
+		panic(fmt.Sprintf("Read() failed: %v", err))
+	}
 	p := protocol{
 		stack: s,
 		sendBufferSize: tcpip.TCPSendBufferSizeRangeOption{
@@ -469,8 +581,10 @@ func NewProtocol(s *stack.Stack) stack.TransportProtocol {
 			Default: DefaultReceiveBufferSize,
 			Max:     MaxBufferSize,
 		},
-		congestionControl:          ccReno,
+		sackEnabled:                true,
+		congestionControl:          cc,
 		availableCongestionControl: []string{ccReno, ccCubic},
+		moderateReceiveBuffer:      true,
 		lingerTimeout:              DefaultTCPLingerTimeout,
 		timeWaitTimeout:            DefaultTCPTimeWaitTimeout,
 		timeWaitReuse:              tcpip.TCPTimeWaitReuseLoopbackOnly,
@@ -479,7 +593,15 @@ func NewProtocol(s *stack.Stack) stack.TransportProtocol {
 		maxRTO:                     MaxRTO,
 		maxRetries:                 MaxRetries,
 		recovery:                   tcpip.TCPRACKLossDetection,
+		seqnumSecret:               seqnumSecret,
+		tsOffsetSecret:             tsOffsetSecret,
+		probe:                      probe,
 	}
-	p.dispatcher.init(s.Rand(), runtime.GOMAXPROCS(0))
+	p.dispatcher.init(s.InsecureRNG(), runtime.GOMAXPROCS(0))
 	return &p
+}
+
+// protocolFromStack retrieves the tcp.protocol instance from stack s.
+func protocolFromStack(s *stack.Stack) *protocol {
+	return s.TransportProtocolInstance(ProtocolNumber).(*protocol)
 }

@@ -22,12 +22,20 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hosttid"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sync"
+)
+
+var (
+	// maximumUserAddress is the largest possible user address.
+	maximumUserAddress = linux.TaskSize
+
+	// stubInitAddress is the initial attempt link address for the stub.
+	stubInitAddress = linux.TaskSize
 )
 
 // Linux kernel errnos which "should never be seen by user programs", but will
@@ -247,7 +255,7 @@ func (s *subprocess) unmap() {
 
 // Release kills the subprocess.
 //
-// Just kidding! We can't safely co-ordinate the detaching of all the
+// Just kidding! We can't safely coordinate the detaching of all the
 // tracees (since the tracers are random runtime threads, and the process
 // won't exit until tracers have been notifier).
 //
@@ -501,18 +509,16 @@ func (t *thread) NotifyInterrupt() {
 // switchToApp is called from the main SwitchToApp entrypoint.
 //
 // This function returns true on a system call, false on a signal.
-func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
+func (s *subprocess) switchToApp(c *context, ac *arch.Context64) bool {
 	// Lock the thread for ptrace operations.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	// Extract floating point state.
 	fpState := ac.FloatingPointData()
-	fpLen, _ := ac.FeatureSet().ExtendedStateSize()
-	useXsave := ac.FeatureSet().UseXsave()
 
 	// Grab our thread from the pool.
-	currentTID := int32(procid.Current())
+	currentTID := int32(hosttid.Current())
 	t := s.sysemuThreads.lookupOrCreate(currentTID, s.newThread)
 
 	// Reset necessary registers.
@@ -534,7 +540,7 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 	if err := t.setRegs(regs); err != nil {
 		panic(fmt.Sprintf("ptrace set regs (%+v) failed: %v", regs, err))
 	}
-	if err := t.setFPRegs(fpState, uint64(fpLen), useXsave); err != nil {
+	if err := t.setFPRegs(fpState, &c.archContext); err != nil {
 		panic(fmt.Sprintf("ptrace set fpregs (%+v) failed: %v", fpState, err))
 	}
 	if err := t.setTLS(&tls); err != nil {
@@ -572,7 +578,7 @@ func (s *subprocess) switchToApp(c *context, ac arch.Context) bool {
 		if err := t.getRegs(regs); err != nil {
 			panic(fmt.Sprintf("ptrace get regs failed: %v", err))
 		}
-		if err := t.getFPRegs(fpState, uint64(fpLen), useXsave); err != nil {
+		if err := t.getFPRegs(fpState, &c.archContext); err != nil {
 			panic(fmt.Sprintf("ptrace get fpregs failed: %v", err))
 		}
 		if err := t.getTLS(&tls); err != nil {
@@ -621,7 +627,7 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 	// Grab a thread.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	currentTID := int32(procid.Current())
+	currentTID := int32(hosttid.Current())
 	t := s.syscallThreads.lookupOrCreate(currentTID, s.newThread)
 
 	return t.syscallIgnoreInterrupt(&t.initRegs, sysno, args...)
@@ -629,17 +635,21 @@ func (s *subprocess) syscall(sysno uintptr, args ...arch.SyscallArgument) (uintp
 
 // MapFile implements platform.AddressSpace.MapFile.
 func (s *subprocess) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
+	fd, err := f.DataFD(fr)
+	if err != nil {
+		return err
+	}
 	var flags int
 	if precommit {
 		flags |= unix.MAP_POPULATE
 	}
-	_, err := s.syscall(
+	_, err = s.syscall(
 		unix.SYS_MMAP,
 		arch.SyscallArgument{Value: uintptr(addr)},
 		arch.SyscallArgument{Value: uintptr(fr.Length())},
 		arch.SyscallArgument{Value: uintptr(at.Prot())},
 		arch.SyscallArgument{Value: uintptr(flags | unix.MAP_SHARED | unix.MAP_FIXED)},
-		arch.SyscallArgument{Value: uintptr(f.FD())},
+		arch.SyscallArgument{Value: uintptr(fd)},
 		arch.SyscallArgument{Value: uintptr(fr.Start)})
 	return err
 }

@@ -19,12 +19,14 @@ package platform
 
 import (
 	"fmt"
-	"os"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/seccomp"
+	"gvisor.dev/gvisor/pkg/seccomp/precompiledseccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -58,6 +60,14 @@ type Platform interface {
 	// is supported.
 	HaveGlobalMemoryBarrier() bool
 
+	// OwnsPageTables returns true if the Platform implementation manages any
+	// page tables directly (rather than via host mmap(2) etc.) As of this
+	// writing, this property is relevant because the AddressSpace interface
+	// does not support specification of memory type (cacheability), such that
+	// host FDs specifying memory types (e.g. device drivers) can only set them
+	// correctly in host-managed page tables.
+	OwnsPageTables() bool
+
 	// MapUnit returns the alignment used for optional mappings into this
 	// platform's AddressSpaces. Higher values indicate lower per-page costs
 	// for AddressSpace.MapFile. As a special case, a MapUnit of 0 indicates
@@ -89,10 +99,10 @@ type Platform interface {
 	//
 	// In general, this blocking behavior only occurs when
 	// CooperativelySchedulesAddressSpace (above) returns false.
-	NewAddressSpace(mappingsID interface{}) (AddressSpace, <-chan struct{}, error)
+	NewAddressSpace(mappingsID any) (AddressSpace, <-chan struct{}, error)
 
 	// NewContext returns a new execution context.
-	NewContext() Context
+	NewContext(context.Context) Context
 
 	// PreemptAllCPUs causes all concurrent calls to Context.Switch(), as well
 	// as the first following call to Context.Switch() for each Context, to
@@ -112,8 +122,8 @@ type Platform interface {
 	// Preconditions: HaveGlobalMemoryBarrier() == true.
 	GlobalMemoryBarrier() error
 
-	// SyscallFilters returns syscalls made exclusively by this platform.
-	SyscallFilters() seccomp.SyscallRules
+	// SeccompInfo returns seccomp-related information about this platform.
+	SeccompInfo() SeccompInfo
 }
 
 // NoCPUPreemptionDetection implements Platform.DetectsCPUPreemption and
@@ -167,6 +177,22 @@ func (UseHostProcessMemoryBarrier) GlobalMemoryBarrier() error {
 	return hostmm.GlobalMemoryBarrier()
 }
 
+// DoesOwnPageTables implements Platform.OwnsPageTables in the positive.
+type DoesOwnPageTables struct{}
+
+// OwnsPageTables implements Platform.OwnsPageTables.
+func (DoesOwnPageTables) OwnsPageTables() bool {
+	return true
+}
+
+// DoesNotOwnPageTables implements Platform.OwnsPageTables in the negative.
+type DoesNotOwnPageTables struct{}
+
+// OwnsPageTables implements Platform.OwnsPageTables.
+func (DoesNotOwnPageTables) OwnsPageTables() bool {
+	return false
+}
+
 // MemoryManager represents an abstraction above the platform address space
 // which manages memory mappings and their contents.
 type MemoryManager interface {
@@ -176,11 +202,13 @@ type MemoryManager interface {
 	MMap(ctx context.Context, opts memmap.MMapOpts) (hostarch.Addr, error)
 	// AddressSpace returns the AddressSpace bound to mm.
 	AddressSpace() AddressSpace
+	// FindVMAByName finds a vma with the specified name.
+	FindVMAByName(ar hostarch.AddrRange, hint string) (hostarch.Addr, uint64, error)
 }
 
 // Context represents the execution context for a single thread.
 type Context interface {
-	// Switch resumes execution of the thread specified by the arch.Context
+	// Switch resumes execution of the thread specified by the arch.Context64
 	// in the provided address space. This call will block while the thread
 	// is executing.
 	//
@@ -192,22 +220,22 @@ type Context interface {
 	//
 	// Switch may return one of the following special errors:
 	//
-	// - nil: The Context invoked a system call.
+	//	- nil: The Context invoked a system call.
 	//
-	// - ErrContextSignal: The Context was interrupted by a signal. The
-	// returned *linux.SignalInfo contains information about the signal. If
-	// linux.SignalInfo.Signo == SIGSEGV, the returned hostarch.AccessType
-	// contains the access type of the triggering fault. The caller owns
-	// the returned SignalInfo.
+	//	- ErrContextSignal: The Context was interrupted by a signal. The
+	//		returned *linux.SignalInfo contains information about the signal. If
+	//		linux.SignalInfo.Signo == SIGSEGV, the returned hostarch.AccessType
+	//		contains the access type of the triggering fault. The caller owns
+	//		the returned SignalInfo.
 	//
-	// - ErrContextInterrupt: The Context was interrupted by a call to
-	// Interrupt(). Switch() may return ErrContextInterrupt spuriously. In
-	// particular, most implementations of Interrupt() will cause the first
-	// following call to Switch() to return ErrContextInterrupt if there is no
-	// concurrent call to Switch().
+	//	- ErrContextInterrupt: The Context was interrupted by a call to
+	//		Interrupt(). Switch() may return ErrContextInterrupt spuriously. In
+	//		particular, most implementations of Interrupt() will cause the first
+	//		following call to Switch() to return ErrContextInterrupt if there is no
+	//		concurrent call to Switch().
 	//
-	// - ErrContextCPUPreempted: See the definition of that error for details.
-	Switch(ctx context.Context, mm MemoryManager, ac arch.Context, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error)
+	//	- ErrContextCPUPreempted: See the definition of that error for details.
+	Switch(ctx context.Context, mm MemoryManager, ac *arch.Context64, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error)
 
 	// PullFullState() pulls a full state of the application thread.
 	//
@@ -221,7 +249,7 @@ type Context interface {
 	// PullFullState() to load all registers and FPU state.
 	//
 	// Preconditions: The caller must be running on the task goroutine.
-	PullFullState(as AddressSpace, ac arch.Context)
+	PullFullState(as AddressSpace, ac *arch.Context64) error
 
 	// FullStateChanged() indicates that a thread state has been changed by
 	// the Sentry. This happens in case of the rt_sigreturn, execve, etc.
@@ -244,19 +272,29 @@ type Context interface {
 
 	// Release() releases any resources associated with this context.
 	Release()
+
+	// PrepareSleep() is called when the tread switches to the
+	// interruptible sleep state.
+	PrepareSleep()
+}
+
+// ContextError is one of the possible errors returned by Context.Switch().
+type ContextError struct {
+	// Err is the underlying error.
+	Err error
+	// Errno is an approximation of what type of error this is supposed to
+	// be as defined by the linux errnos.
+	Errno unix.Errno
+}
+
+func (e *ContextError) Error() string {
+	return e.Err.Error()
 }
 
 var (
 	// ErrContextSignal is returned by Context.Switch() to indicate that the
 	// Context was interrupted by a signal.
 	ErrContextSignal = fmt.Errorf("interrupted by signal")
-
-	// ErrContextSignalCPUID is equivalent to ErrContextSignal, except that
-	// a check should be done for execution of the CPUID instruction. If
-	// the current instruction pointer is a CPUID instruction, then this
-	// should be emulated appropriately. If not, then the given signal
-	// should be handled per above.
-	ErrContextSignalCPUID = fmt.Errorf("interrupted by signal, possible CPUID")
 
 	// ErrContextInterrupt is returned by Context.Switch() to indicate that the
 	// Context was interrupted by a call to Context.Interrupt().
@@ -265,15 +303,15 @@ var (
 	// ErrContextCPUPreempted is returned by Context.Switch() to indicate that
 	// one of the following occurred:
 	//
-	// - The CPU executing the Context is not the CPU passed to
-	// Context.Switch().
+	//	- The CPU executing the Context is not the CPU passed to
+	//		Context.Switch().
 	//
-	// - The CPU executing the Context may have executed another Context since
-	// the last time it executed this one; or the CPU has previously executed
-	// another Context, and has never executed this one.
+	//	- The CPU executing the Context may have executed another Context since
+	//		the last time it executed this one; or the CPU has previously executed
+	//		another Context, and has never executed this one.
 	//
-	// - Platform.PreemptAllCPUs() was called since the last return from
-	// Context.Switch().
+	//	- Platform.PreemptAllCPUs() was called since the last return from
+	//		Context.Switch().
 	ErrContextCPUPreempted = fmt.Errorf("interrupted by CPU preemption")
 )
 
@@ -298,18 +336,18 @@ type AddressSpace interface {
 	// implementations may choose to ignore it.
 	//
 	// Preconditions:
-	// * addr and fr must be page-aligned.
-	// * fr.Length() > 0.
-	// * at.Any() == true.
-	// * At least one reference must be held on all pages in fr, and must
-	//   continue to be held as long as pages are mapped.
+	//	* addr and fr must be page-aligned.
+	//	* fr.Length() > 0.
+	//	* at.Any() == true.
+	//	* At least one reference must be held on all pages in fr, and must
+	//		continue to be held as long as pages are mapped.
 	MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error
 
 	// Unmap unmaps the given range.
 	//
 	// Preconditions:
-	// * addr is page-aligned.
-	// * length > 0.
+	//	* addr is page-aligned.
+	//	* length > 0.
 	Unmap(addr hostarch.Addr, length uint64)
 
 	// Release releases this address space. After releasing, a new AddressSpace
@@ -417,12 +455,86 @@ func (f SegmentationFault) Error() string {
 
 // Requirements is used to specify platform specific requirements.
 type Requirements struct {
-	// RequiresCurrentPIDNS indicates that the sandbox has to be started in the
-	// current pid namespace.
-	RequiresCurrentPIDNS bool
 	// RequiresCapSysPtrace indicates that the sandbox has to be started with
 	// the CAP_SYS_PTRACE capability.
 	RequiresCapSysPtrace bool
+}
+
+// SeccompInfo represents seccomp-bpf data for a given platform.
+type SeccompInfo interface {
+	// Variables returns a map from named variables to the value they should
+	// have with the platform as currently initialized.
+	// Variables are known only at runtime, but are not part of a platform's
+	// configuration. For example, the KVM platform having an FD representing
+	// the KVM VM is a variable: it is only known at runtime, but does not
+	// change the structure of the syscall rules.
+	// The set of variable names must be static regardless of platform
+	// configuration.
+	Variables() precompiledseccomp.Values
+
+	// ConfigKey returns a string that uniquely represents the set of
+	// configuration information from which syscall rules are derived,
+	// other than variables or CPU architecture.
+	// This should at least contain the platform name.
+	// If syscall rules are dependent on the platform's configuration,
+	// this should return a string that encapsulates the values of these
+	// configuration options.
+	// For example, if some option of the platform causes it to require a
+	// new syscall to be allowed, this option should be part of this string.
+	ConfigKey() string
+
+	// SyscallFilters returns syscalls made exclusively by this platform.
+	// `vars` maps variable names (as returned by `Variables()`) to values,
+	// and **the rules should depend on `vars`**. These will not necessarily
+	// map to the result of calling `Variables()` on the current `SeccompInfo`;
+	// during seccomp rule precompilation, these will be set to placeholder
+	// values.
+	SyscallFilters(vars precompiledseccomp.Values) seccomp.SyscallRules
+
+	// HottestSyscalls returns the list of syscall numbers that this platform
+	// calls most often, most-frequently-called first. No more than a dozen
+	// syscalls. Returning an empty or a nil slice is OK.
+	// This is used to produce a more efficient seccomp-bpf program that can
+	// check for the most frequently called syscalls first.
+	// What matters here is only the frequency at which a syscall is called,
+	// not the total amount of CPU time that is used to process it in the host
+	// kernel.
+	HottestSyscalls() []uintptr
+}
+
+// StaticSeccompInfo implements `SeccompInfo` for platforms which don't have
+// any configuration or variables.
+type StaticSeccompInfo struct {
+	// PlatformName is the platform name.
+	PlatformName string
+
+	// Filters is the platform's syscall filters.
+	Filters seccomp.SyscallRules
+
+	// HotSyscalls is the list of syscalls numbers that this platform
+	// calls most often, most-frequently-called first.
+	// See `SeccompInfo.HottestSyscalls` for more.
+	HotSyscalls []uintptr
+}
+
+// Variables implements `SeccompInfo.Variables`.
+func (StaticSeccompInfo) Variables() precompiledseccomp.Values {
+	return nil
+}
+
+// ConfigKey implements `SeccompInfo.ConfigKey`.
+func (s StaticSeccompInfo) ConfigKey() string {
+	return s.PlatformName
+}
+
+// SyscallFilters implements `SeccompInfo.SyscallFilters`.
+func (s StaticSeccompInfo) SyscallFilters(precompiledseccomp.Values) seccomp.SyscallRules {
+	return s.Filters
+}
+
+// HottestSyscalls implements `SeccompInfo.HottestSyscalls`.
+func (s StaticSeccompInfo) HottestSyscalls() []uintptr {
+	return s.HotSyscalls
 }
 
 // Constructor represents a platform type.
@@ -431,12 +543,20 @@ type Constructor interface {
 	//
 	// Arguments:
 	//
-	// * deviceFile - the device file (e.g. /dev/kvm for the KVM platform).
-	New(deviceFile *os.File) (Platform, error)
-	OpenDevice() (*os.File, error)
+	//	* deviceFile - the device file (e.g. /dev/kvm for the KVM platform).
+	New(deviceFile *fd.FD) (Platform, error)
+
+	// OpenDevice opens the path to the device used by the platform.
+	// Passing in an empty string will use the default path for the device,
+	// e.g. "/dev/kvm" for the KVM platform.
+	OpenDevice(devicePath string) (*fd.FD, error)
 
 	// Requirements returns platform specific requirements.
 	Requirements() Requirements
+
+	// PrecompiledSeccompInfo returns a list of `SeccompInfo`s that is
+	// useful to precompile into the Sentry.
+	PrecompiledSeccompInfo() []SeccompInfo
 }
 
 // platforms contains all available platform types.
@@ -445,6 +565,14 @@ var platforms = map[string]Constructor{}
 // Register registers a new platform type.
 func Register(name string, platform Constructor) {
 	platforms[name] = platform
+}
+
+// List lists available platforms.
+func List() (available []string) {
+	for name := range platforms {
+		available = append(available, name)
+	}
+	return
 }
 
 // Lookup looks up the platform constructor by name.

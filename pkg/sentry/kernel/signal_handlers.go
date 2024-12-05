@@ -16,7 +16,6 @@ package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // SignalHandlers holds information about signal actions.
@@ -26,7 +25,7 @@ type SignalHandlers struct {
 	// mu protects actions, as well as the signal state of all tasks and thread
 	// groups using this SignalHandlers object. (See comment on
 	// ThreadGroup.signalHandlers.)
-	mu sync.Mutex `state:"nosave"`
+	mu signalHandlersMutex `state:"nosave"`
 
 	// actions is the action to be taken upon receiving each signal.
 	actions map[linux.Signal]linux.SigAction
@@ -51,12 +50,12 @@ func (sh *SignalHandlers) Fork() *SignalHandlers {
 	return sh2
 }
 
-// CopyForExec returns a copy of sh for a thread group that is undergoing an
-// execve. (See comments in Task.finishExec.)
-func (sh *SignalHandlers) CopyForExec() *SignalHandlers {
+// copyForExecLocked returns a copy of sh for a thread group that is undergoing
+// an execve. (See comments in Task.finishExec.)
+//
+// Preconditions: sh.mu must be locked.
+func (sh *SignalHandlers) copyForExecLocked() *SignalHandlers {
 	sh2 := NewSignalHandlers()
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
 	for sig, act := range sh.actions {
 		if act.Handler == linux.SIG_IGN {
 			sh2.actions[sig] = linux.SigAction{

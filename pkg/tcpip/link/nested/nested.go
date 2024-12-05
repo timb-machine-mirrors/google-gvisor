@@ -28,12 +28,14 @@ import (
 // concurrency guards.
 //
 // See the tests in this package for example usage.
+//
+// +stateify savable
 type Endpoint struct {
 	child    stack.LinkEndpoint
 	embedder stack.NetworkDispatcher
 
 	// mu protects dispatcher.
-	mu         sync.RWMutex
+	mu         sync.RWMutex `state:"nosave"`
 	dispatcher stack.NetworkDispatcher
 }
 
@@ -51,22 +53,22 @@ func (e *Endpoint) Init(child stack.LinkEndpoint, embedder stack.NetworkDispatch
 }
 
 // DeliverNetworkPacket implements stack.NetworkDispatcher.
-func (e *Endpoint) DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (e *Endpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	e.mu.RLock()
 	d := e.dispatcher
 	e.mu.RUnlock()
 	if d != nil {
-		d.DeliverNetworkPacket(remote, local, protocol, pkt)
+		d.DeliverNetworkPacket(protocol, pkt)
 	}
 }
 
-// DeliverOutboundPacket implements stack.NetworkDispatcher.DeliverOutboundPacket.
-func (e *Endpoint) DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+// DeliverLinkPacket implements stack.NetworkDispatcher.
+func (e *Endpoint) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	e.mu.RLock()
 	d := e.dispatcher
 	e.mu.RUnlock()
 	if d != nil {
-		d.DeliverOutboundPacket(remote, local, protocol, pkt)
+		d.DeliverLinkPacket(protocol, pkt)
 	}
 }
 
@@ -97,6 +99,11 @@ func (e *Endpoint) MTU() uint32 {
 	return e.child.MTU()
 }
 
+// SetMTU implements stack.LinkEndpoint.
+func (e *Endpoint) SetMTU(mtu uint32) {
+	e.child.SetMTU(mtu)
+}
+
 // Capabilities implements stack.LinkEndpoint.
 func (e *Endpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return e.child.Capabilities()
@@ -112,14 +119,16 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 	return e.child.LinkAddress()
 }
 
-// WritePacket implements stack.LinkEndpoint.
-func (e *Endpoint) WritePacket(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	return e.child.WritePacket(r, protocol, pkt)
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (e *Endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.child.SetLinkAddress(addr)
 }
 
 // WritePackets implements stack.LinkEndpoint.
-func (e *Endpoint) WritePackets(r stack.RouteInfo, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
-	return e.child.WritePackets(r, pkts, protocol)
+func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	return e.child.WritePackets(pkts)
 }
 
 // Wait implements stack.LinkEndpoint.
@@ -149,6 +158,21 @@ func (e *Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *Endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	e.child.AddHeader(local, remote, protocol, pkt)
+func (e *Endpoint) AddHeader(pkt *stack.PacketBuffer) {
+	e.child.AddHeader(pkt)
+}
+
+// ParseHeader implements stack.LinkEndpoint.ParseHeader.
+func (e *Endpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
+	return e.child.ParseHeader(pkt)
+}
+
+// Close implements stack.LinkEndpoint.
+func (e *Endpoint) Close() {
+	e.child.Close()
+}
+
+// SetOnCloseAction implement stack.LinkEndpoints.
+func (e *Endpoint) SetOnCloseAction(action func()) {
+	e.child.SetOnCloseAction(action)
 }

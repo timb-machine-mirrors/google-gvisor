@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package channel provides the implemention of channel-based data-link layer
+// Package channel provides the implementation of channel-based data-link layer
 // endpoints. Such endpoints allow injection of inbound packets and store
 // outbound packets in a channel.
 package channel
@@ -20,18 +20,10 @@ package channel
 import (
 	"context"
 
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
-
-// PacketInfo holds all the information about an outbound packet.
-type PacketInfo struct {
-	Pkt   *stack.PacketBuffer
-	Proto tcpip.NetworkProtocolNumber
-	Route stack.RouteInfo
-}
 
 // Notification is the interface for receiving notification from the packet
 // queue.
@@ -50,52 +42,67 @@ type NotificationHandle struct {
 
 type queue struct {
 	// c is the outbound packet channel.
-	c chan PacketInfo
-	// mu protects fields below.
-	mu     sync.RWMutex
+	c  chan *stack.PacketBuffer
+	mu queueRWMutex
+	// +checklocks:mu
 	notify []*NotificationHandle
+	// +checklocks:mu
+	closed bool
 }
 
 func (q *queue) Close() {
-	close(q.c)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.closed {
+		close(q.c)
+	}
+	q.closed = true
 }
 
-func (q *queue) Read() (PacketInfo, bool) {
+func (q *queue) Read() *stack.PacketBuffer {
 	select {
 	case p := <-q.c:
-		return p, true
+		return p
 	default:
-		return PacketInfo{}, false
+		return nil
 	}
 }
 
-func (q *queue) ReadContext(ctx context.Context) (PacketInfo, bool) {
+func (q *queue) ReadContext(ctx context.Context) *stack.PacketBuffer {
 	select {
 	case pkt := <-q.c:
-		return pkt, true
+		return pkt
 	case <-ctx.Done():
-		return PacketInfo{}, false
+		return nil
 	}
 }
 
-func (q *queue) Write(p PacketInfo) bool {
+func (q *queue) Write(pkt *stack.PacketBuffer) tcpip.Error {
+	// q holds the PacketBuffer.
+	q.mu.RLock()
+	if q.closed {
+		q.mu.RUnlock()
+		return &tcpip.ErrClosedForSend{}
+	}
+
 	wrote := false
 	select {
-	case q.c <- p:
+	case q.c <- pkt.IncRef():
 		wrote = true
 	default:
+		pkt.DecRef()
 	}
-	q.mu.Lock()
 	notify := q.notify
-	q.mu.Unlock()
+	q.mu.RUnlock()
 
 	if wrote {
 		// Send notification outside of lock.
 		for _, h := range notify {
 			h.n.WriteNotify()
 		}
+		return nil
 	}
-	return wrote
+	return &tcpip.ErrNoBufferSpace{}
 }
 
 func (q *queue) Num() int {
@@ -128,12 +135,19 @@ var _ stack.GSOEndpoint = (*Endpoint)(nil)
 
 // Endpoint is link layer endpoint that stores outbound packets in a channel
 // and allows injection of inbound packets.
+//
+// +stateify savable
 type Endpoint struct {
-	dispatcher         stack.NetworkDispatcher
-	mtu                uint32
-	linkAddr           tcpip.LinkAddress
 	LinkEPCapabilities stack.LinkEndpointCapabilities
 	SupportedGSOKind   stack.SupportedGSO
+
+	mu endpointRWMutex `state:"nosave"`
+	// +checklocks:mu
+	dispatcher stack.NetworkDispatcher
+	// +checklocks:mu
+	linkAddr tcpip.LinkAddress
+	// +checklocks:mu
+	mtu uint32
 
 	// Outbound packet queue.
 	q *queue
@@ -143,39 +157,39 @@ type Endpoint struct {
 func New(size int, mtu uint32, linkAddr tcpip.LinkAddress) *Endpoint {
 	return &Endpoint{
 		q: &queue{
-			c: make(chan PacketInfo, size),
+			c: make(chan *stack.PacketBuffer, size),
 		},
 		mtu:      mtu,
 		linkAddr: linkAddr,
 	}
 }
 
-// Close closes e. Further packet injections will panic. Reads continue to
-// succeed until all packets are read.
+// Close closes e. Further packet injections will return an error, and all pending
+// packets are discarded. Close may be called concurrently with WritePackets.
 func (e *Endpoint) Close() {
 	e.q.Close()
+	e.Drain()
 }
 
 // Read does non-blocking read one packet from the outbound packet queue.
-func (e *Endpoint) Read() (PacketInfo, bool) {
+func (e *Endpoint) Read() *stack.PacketBuffer {
 	return e.q.Read()
 }
 
 // ReadContext does blocking read for one packet from the outbound packet queue.
-// It can be cancelled by ctx, and in this case, it returns false.
-func (e *Endpoint) ReadContext(ctx context.Context) (PacketInfo, bool) {
+// It can be cancelled by ctx, and in this case, it returns nil.
+func (e *Endpoint) ReadContext(ctx context.Context) *stack.PacketBuffer {
 	return e.q.ReadContext(ctx)
 }
 
 // Drain removes all outbound packets from the channel and counts them.
 func (e *Endpoint) Drain() int {
 	c := 0
-	for {
-		if _, ok := e.Read(); !ok {
-			return c
-		}
+	for pkt := e.Read(); pkt != nil; pkt = e.Read() {
+		pkt.DecRef()
 		c++
 	}
+	return c
 }
 
 // NumQueued returns the number of packet queued for outbound.
@@ -183,31 +197,44 @@ func (e *Endpoint) NumQueued() int {
 	return e.q.Num()
 }
 
-// InjectInbound injects an inbound packet.
+// InjectInbound injects an inbound packet. If the endpoint is not attached, the
+// packet is not delivered.
 func (e *Endpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	e.InjectLinkAddr(protocol, "", pkt)
-}
-
-// InjectLinkAddr injects an inbound packet with a remote link address.
-func (e *Endpoint) InjectLinkAddr(protocol tcpip.NetworkProtocolNumber, remote tcpip.LinkAddress, pkt *stack.PacketBuffer) {
-	e.dispatcher.DeliverNetworkPacket(remote, "" /* local */, protocol, pkt)
+	e.mu.RLock()
+	d := e.dispatcher
+	e.mu.RUnlock()
+	if d != nil {
+		d.DeliverNetworkPacket(protocol, pkt)
+	}
 }
 
 // Attach saves the stack network-layer dispatcher for use later when packets
 // are injected.
 func (e *Endpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.dispatcher = dispatcher
 }
 
 // IsAttached implements stack.LinkEndpoint.IsAttached.
 func (e *Endpoint) IsAttached() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.dispatcher != nil
 }
 
-// MTU implements stack.LinkEndpoint.MTU. It returns the value initialized
-// during construction.
+// MTU implements stack.LinkEndpoint.MTU.
 func (e *Endpoint) MTU() uint32 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.mtu
+}
+
+// SetMTU implements stack.LinkEndpoint.SetMTU.
+func (e *Endpoint) SetMTU(mtu uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.mtu = mtu
 }
 
 // Capabilities implements stack.LinkEndpoint.Capabilities.
@@ -233,33 +260,27 @@ func (*Endpoint) MaxHeaderLength() uint16 {
 
 // LinkAddress returns the link address of this endpoint.
 func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.linkAddr
 }
 
-// WritePacket stores outbound packets into the channel.
-func (e *Endpoint) WritePacket(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
-	p := PacketInfo{
-		Pkt:   pkt,
-		Proto: protocol,
-		Route: r,
-	}
-
-	e.q.Write(p)
-
-	return nil
+// SetLinkAddress implements stack.LinkEndpoint.SetLinkAddress.
+func (e *Endpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.linkAddr = addr
 }
 
 // WritePackets stores outbound packets into the channel.
-func (e *Endpoint) WritePackets(r stack.RouteInfo, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+// Multiple concurrent calls are permitted.
+func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	n := 0
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
-		p := PacketInfo{
-			Pkt:   pkt,
-			Proto: protocol,
-			Route: r,
-		}
-
-		if !e.q.Write(p) {
+	for _, pkt := range pkts.AsSlice() {
+		if err := e.q.Write(pkt); err != nil {
+			if _, ok := err.(*tcpip.ErrNoBufferSpace); !ok && n == 0 {
+				return 0, err
+			}
 			break
 		}
 		n++
@@ -288,5 +309,10 @@ func (*Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (*Endpoint) AddHeader(tcpip.LinkAddress, tcpip.LinkAddress, tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
-}
+func (*Endpoint) AddHeader(*stack.PacketBuffer) {}
+
+// ParseHeader implements stack.LinkEndpoint.ParseHeader.
+func (*Endpoint) ParseHeader(*stack.PacketBuffer) bool { return true }
+
+// SetOnCloseAction implements stack.LinkEndpoint.
+func (*Endpoint) SetOnCloseAction(func()) {}

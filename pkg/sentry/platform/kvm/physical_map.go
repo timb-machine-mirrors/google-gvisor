@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ring0"
 )
@@ -32,6 +33,7 @@ type region struct {
 type physicalRegion struct {
 	region
 	physical uintptr
+	readOnly bool
 }
 
 // physicalRegions contains a list of available physical regions.
@@ -55,17 +57,19 @@ func fillAddressSpace() (excludedRegions []region) {
 	// We exclude reservedMemory below from our physical memory size, so it
 	// needs to be dropped here as well. Otherwise, we could end up with
 	// physical addresses that are beyond what is mapped.
-	pSize := uintptr(1) << ring0.PhysicalAddressBits()
+	pSize := uintptr(1) << ring0.PhysicalAddressBits
 	pSize -= reservedMemory
 
 	// Add specifically excluded regions; see excludeVirtualRegion.
-	applyVirtualRegions(func(vr virtualRegion) {
+	if err := applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) {
 			excludedRegions = append(excludedRegions, vr.region)
 			vSize -= vr.length
 			log.Infof("excluded: virtual [%x,%x)", vr.virtual, vr.virtual+vr.length)
 		}
-	})
+	}); err != nil {
+		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
+	}
 
 	// Do we need any more work?
 	if vSize < pSize {
@@ -90,7 +94,7 @@ func fillAddressSpace() (excludedRegions []region) {
 	required := uintptr(requiredAddr)
 	current := required // Attempted mmap size.
 	for filled := uintptr(0); filled < required && current > 0; {
-		addr, _, errno := unix.RawSyscall6(
+		addr, errno := hostsyscall.RawSyscall6(
 			unix.SYS_MMAP,
 			0, // Suggested address.
 			current,
@@ -98,6 +102,11 @@ func fillAddressSpace() (excludedRegions []region) {
 			unix.MAP_ANONYMOUS|unix.MAP_PRIVATE|unix.MAP_NORESERVE,
 			0, 0)
 		if errno != 0 {
+			// One page is the smallest mapping that can be allocated.
+			if current == hostarch.PageSize {
+				current = 0
+				break
+			}
 			// Attempt half the size; overflow not possible.
 			currentAddr, _ := hostarch.Addr(current >> 1).RoundUp()
 			current = uintptr(currentAddr)
@@ -105,13 +114,29 @@ func fillAddressSpace() (excludedRegions []region) {
 		}
 		// We filled a block.
 		filled += current
-		excludedRegions = append(excludedRegions, region{
-			virtual: addr,
-			length:  current,
-		})
-		// See comment above.
-		if filled != required {
-			required += faultBlockSize
+		// Check whether a new region is merged with a previous one.
+		for i := range excludedRegions {
+			if excludedRegions[i].virtual == addr+current {
+				excludedRegions[i].virtual = addr
+				excludedRegions[i].length += current
+				addr = 0
+				break
+			}
+			if excludedRegions[i].virtual+excludedRegions[i].length == addr {
+				excludedRegions[i].length += current
+				addr = 0
+				break
+			}
+		}
+		if addr != 0 {
+			excludedRegions = append(excludedRegions, region{
+				virtual: addr,
+				length:  current,
+			})
+			// See comment above.
+			if filled != required {
+				required += faultBlockSize
+			}
 		}
 	}
 	if current == 0 {
@@ -167,6 +192,9 @@ func computePhysicalRegions(excludedRegions []region) (physicalRegions []physica
 		lastExcludedEnd = r.virtual + r.length
 	}
 	addValidRegion(lastExcludedEnd, ring0.MaximumUserAddress-lastExcludedEnd)
+
+	// Do arch-specific actions on physical regions.
+	physicalRegions = archPhysicalRegions(physicalRegions)
 
 	// Dump our all physical regions.
 	for _, r := range physicalRegions {

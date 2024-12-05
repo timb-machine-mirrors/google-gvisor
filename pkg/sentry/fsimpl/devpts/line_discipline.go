@@ -16,14 +16,15 @@ package devpts
 
 import (
 	"bytes"
+	"unicode"
 	"unicode/utf8"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -46,8 +47,8 @@ const (
 // modify control characters (e.g. Ctrl-C for SIGINT), etc. The following man
 // pages are good resources for how to affect the line discipline:
 //
-//   * termios(3)
-//   * tty_ioctl(4)
+//   - termios(3)
+//   - tty_ioctl(4)
 //
 // This file corresponds most closely to drivers/tty/n_tty.c.
 //
@@ -58,26 +59,29 @@ const (
 // discipline reads the bytes, modifies them or takes special action if
 // required, and enqueues them to be read by the other end of the pty:
 //
-//       input from terminal    +-------------+   input to process (e.g. bash)
-//    +------------------------>| input queue |---------------------------+
-//    |   (inputQueueWrite)     +-------------+     (inputQueueRead)      |
-//    |                                                                   |
-//    |                                                                   v
+//	   input from terminal    +-------------+   input to process (e.g. bash)
+//	+------------------------>| input queue |---------------------------+
+//	|   (inputQueueWrite)     +-------------+     (inputQueueRead)      |
+//	|                                                                   |
+//	|                                                                   v
+//
 // masterFD                                                           replicaFD
-//    ^                                                                   |
-//    |                                                                   |
-//    |   output to terminal   +--------------+    output from process    |
-//    +------------------------| output queue |<--------------------------+
-//        (outputQueueRead)    +--------------+    (outputQueueWrite)
+//
+//	^                                                                   |
+//	|                                                                   |
+//	|   output to terminal   +--------------+    output from process    |
+//	+------------------------| output queue |<--------------------------+
+//	    (outputQueueRead)    +--------------+    (outputQueueWrite)
 //
 // There is special handling for the ECHO option, where bytes written to the
 // input queue are also output back to the terminal by being written to
 // l.outQueue by the input queue transformer.
 //
 // Lock order:
-//  termiosMu
-//    inQueue.mu
-//      outQueue.mu
+//
+//	termiosMu
+//	  inQueue.mu
+//	    outQueue.mu
 //
 // +stateify savable
 type lineDiscipline struct {
@@ -103,15 +107,24 @@ type lineDiscipline struct {
 	// handling certain special characters like backspace.
 	column int
 
+	// numReplicas is the number of replica file descriptors.
+	numReplicas int
+
 	// masterWaiter is used to wait on the master end of the TTY.
 	masterWaiter waiter.Queue
 
 	// replicaWaiter is used to wait on the replica end of the TTY.
 	replicaWaiter waiter.Queue
+
+	// terminal is the terminal linked to this lineDiscipline.
+	terminal *Terminal
 }
 
-func newLineDiscipline(termios linux.KernelTermios) *lineDiscipline {
-	ld := lineDiscipline{termios: termios}
+func newLineDiscipline(termios linux.KernelTermios, terminal *Terminal) *lineDiscipline {
+	ld := lineDiscipline{
+		termios:  termios,
+		terminal: terminal,
+	}
 	ld.inQueue.transformer = &inputQueueTransformer{}
 	ld.outQueue.transformer = &outputQueueTransformer{}
 	return &ld
@@ -142,7 +155,7 @@ func (l *lineDiscipline) setTermios(task *kernel.Task, args arch.SyscallArgument
 	if oldCanonEnabled && !l.termios.LEnabled(linux.ICANON) {
 		l.inQueue.mu.Lock()
 		l.inQueue.pushWaitBufLocked(l)
-		l.inQueue.readable = true
+		l.inQueue.readable = len(l.inQueue.readBuf) > 0
 		l.inQueue.mu.Unlock()
 		l.termiosMu.Unlock()
 		l.replicaWaiter.Notify(waiter.ReadableEvents)
@@ -168,9 +181,14 @@ func (l *lineDiscipline) setWindowSize(t *kernel.Task, args arch.SyscallArgument
 }
 
 func (l *lineDiscipline) masterReadiness() waiter.EventMask {
-	// We don't have to lock a termios because the default master termios
-	// is immutable.
-	return l.inQueue.writeReadiness(&linux.MasterTermios) | l.outQueue.readReadiness(&linux.MasterTermios)
+	// The master termios is immutable so termiosMu is not needed.
+	res := l.inQueue.writeReadiness(&linux.MasterTermios) | l.outQueue.readReadiness(&linux.MasterTermios)
+	l.termiosMu.RLock()
+	if l.numReplicas == 0 {
+		res |= waiter.EventHUp
+	}
+	l.termiosMu.RUnlock()
+	return res
 }
 
 func (l *lineDiscipline) replicaReadiness() waiter.EventMask {
@@ -186,6 +204,7 @@ func (l *lineDiscipline) inputQueueReadSize(t *kernel.Task, io usermem.IO, args 
 func (l *lineDiscipline) inputQueueRead(ctx context.Context, dst usermem.IOSequence) (int64, error) {
 	l.termiosMu.RLock()
 	n, pushed, notifyEcho, err := l.inQueue.read(ctx, dst, l)
+	isCanon := l.termios.LEnabled(linux.ICANON)
 	l.termiosMu.RUnlock()
 	if err != nil {
 		return 0, err
@@ -200,10 +219,15 @@ func (l *lineDiscipline) inputQueueRead(ctx context.Context, dst usermem.IOSeque
 			l.replicaWaiter.Notify(waiter.ReadableEvents)
 		}
 		return n, nil
-	} else if notifyEcho {
+	}
+	if notifyEcho {
 		l.masterWaiter.Notify(waiter.ReadableEvents)
 	}
-	return 0, syserror.ErrWouldBlock
+	if !pushed && isCanon {
+		return 0, nil // EOF
+	}
+
+	return 0, linuxerr.ErrWouldBlock
 }
 
 func (l *lineDiscipline) inputQueueWrite(ctx context.Context, src usermem.IOSequence) (int64, error) {
@@ -220,7 +244,7 @@ func (l *lineDiscipline) inputQueueWrite(ctx context.Context, src usermem.IOSequ
 		l.replicaWaiter.Notify(waiter.ReadableEvents)
 		return n, nil
 	}
-	return 0, syserror.ErrWouldBlock
+	return 0, linuxerr.ErrWouldBlock
 }
 
 func (l *lineDiscipline) outputQueueReadSize(t *kernel.Task, io usermem.IO, args arch.SyscallArguments) error {
@@ -242,7 +266,7 @@ func (l *lineDiscipline) outputQueueRead(ctx context.Context, dst usermem.IOSequ
 		}
 		return n, nil
 	}
-	return 0, syserror.ErrWouldBlock
+	return 0, linuxerr.ErrWouldBlock
 }
 
 func (l *lineDiscipline) outputQueueWrite(ctx context.Context, src usermem.IOSequence) (int64, error) {
@@ -253,11 +277,26 @@ func (l *lineDiscipline) outputQueueWrite(ctx context.Context, src usermem.IOSeq
 	if err != nil {
 		return 0, err
 	}
-	if n > 0 {
-		l.masterWaiter.Notify(waiter.ReadableEvents)
-		return n, nil
+	l.masterWaiter.Notify(waiter.ReadableEvents)
+	return n, nil
+}
+
+// replicaOpen is called when a replica file descriptor is opened.
+func (l *lineDiscipline) replicaOpen() {
+	l.termiosMu.Lock()
+	defer l.termiosMu.Unlock()
+	l.numReplicas++
+}
+
+// replicaClose is called when a replica file descriptor is closed.
+func (l *lineDiscipline) replicaClose() {
+	l.termiosMu.Lock()
+	l.numReplicas--
+	notify := l.numReplicas == 0
+	l.termiosMu.Unlock()
+	if notify {
+		l.masterWaiter.Notify(waiter.EventHUp)
 	}
-	return 0, syserror.ErrWouldBlock
 }
 
 // transformer is a helper interface to make it easier to stateify queue.
@@ -277,54 +316,74 @@ type outputQueueTransformer struct{}
 // drivers/tty/n_tty.c:do_output_char for an analogous kernel function.
 //
 // Preconditions:
-// * l.termiosMu must be held for reading.
-// * q.mu must be held.
+//   - l.termiosMu must be held for reading.
+//   - q.mu must be held.
 func (*outputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte) (int, bool) {
 	// transformOutput is effectively always in noncanonical mode, as the
 	// master termios never has ICANON set.
+	sizeBudget := nonCanonMaxBytes - len(q.readBuf)
+	if sizeBudget <= 0 {
+		return 0, false
+	}
 
 	if !l.termios.OEnabled(linux.OPOST) {
-		q.readBuf = append(q.readBuf, buf...)
+		copySize := min(len(buf), sizeBudget)
+		q.readBuf = append(q.readBuf, buf[:copySize]...)
 		if len(q.readBuf) > 0 {
 			q.readable = true
 		}
-		return len(buf), false
+		return copySize, false
 	}
 
 	var ret int
-	for len(buf) > 0 {
+
+Outer:
+	for ; len(buf) > 0 && sizeBudget > 0; sizeBudget = nonCanonMaxBytes - len(q.readBuf) {
 		size := l.peek(buf)
+		if size > sizeBudget {
+			break Outer
+		}
 		cBytes := append([]byte{}, buf[:size]...)
-		ret += size
 		buf = buf[size:]
 		// We're guaranteed that cBytes has at least one element.
+	cByteSwitch:
 		switch cBytes[0] {
 		case '\n':
 			if l.termios.OEnabled(linux.ONLRET) {
 				l.column = 0
 			}
 			if l.termios.OEnabled(linux.ONLCR) {
+				if sizeBudget < 2 {
+					break Outer
+				}
+				ret += size
 				q.readBuf = append(q.readBuf, '\r', '\n')
-				continue
+				continue Outer
 			}
 		case '\r':
 			if l.termios.OEnabled(linux.ONOCR) && l.column == 0 {
-				continue
+				// Treat the carriage return as processed, since it's a no-op.
+				ret += size
+				continue Outer
 			}
 			if l.termios.OEnabled(linux.OCRNL) {
 				cBytes[0] = '\n'
 				if l.termios.OEnabled(linux.ONLRET) {
 					l.column = 0
 				}
-				break
+				break cByteSwitch
 			}
 			l.column = 0
 		case '\t':
 			spaces := spacesPerTab - l.column%spacesPerTab
 			if l.termios.OutputFlags&linux.TABDLY == linux.XTABS {
+				if sizeBudget < spacesPerTab {
+					break Outer
+				}
+				ret += size
 				l.column += spaces
 				q.readBuf = append(q.readBuf, bytes.Repeat([]byte{' '}, spacesPerTab)...)
-				continue
+				continue Outer
 			}
 			l.column += spaces
 		case '\b':
@@ -334,6 +393,7 @@ func (*outputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte
 		default:
 			l.column++
 		}
+		ret += size
 		q.readBuf = append(q.readBuf, cBytes...)
 	}
 	if len(q.readBuf) > 0 {
@@ -356,8 +416,8 @@ type inputQueueTransformer struct{}
 // echoed, in which case we need to notify readers.
 //
 // Preconditions:
-// * l.termiosMu must be held for reading.
-// * q.mu must be held.
+//   - l.termiosMu must be held for reading.
+//   - q.mu must be held.
 func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte) (int, bool) {
 	// If there's a line waiting to be read in canonical mode, don't write
 	// anything else to the read buffer.
@@ -390,6 +450,104 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			if l.termios.IEnabled(linux.INLCR) {
 				cBytes[0] = '\r'
 			}
+		case l.termios.ControlCharacters[linux.VINTR]: // ctrl-c
+			// The input queue is reading from the master TTY and
+			// writing to the replica TTY which is connected to the
+			// interactive program (like bash). We want to send the
+			// signal the process connected to the replica TTY.
+			l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(linux.SIGINT))
+		case l.termios.ControlCharacters[linux.VSUSP]: // ctrl-z
+			l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(linux.SIGTSTP))
+		case l.termios.ControlCharacters[linux.VQUIT]: // ctrl-\
+			l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(linux.SIGQUIT))
+
+		// In canonical mode, some characters need to be handled specially; for example, backspace.
+		// This roughly aligns with n_tty.c:n_tty_receive_char_canon and n_tty.c:eraser
+		// cBytes[0] == ControlCharacters[linux.VKILL] is also handled by n_tty.c:eraser, but this isn't implemented
+		case l.termios.ControlCharacters[linux.VWERASE]:
+			if !l.termios.LEnabled(linux.IEXTEN) {
+				break
+			}
+			fallthrough
+		case l.termios.ControlCharacters[linux.VERASE]:
+			if !l.termios.LEnabled(linux.ICANON) {
+				break
+			}
+
+			c := cBytes[0]
+			killType := linux.VERASE
+			if c == l.termios.ControlCharacters[linux.VWERASE] {
+				killType = linux.VWERASE
+			}
+			seenAlphanumeric := false
+			for len(q.readBuf) > 0 {
+				// Erase a character. If IUTF8 is enabled, erase an entire multibyte unicode character.
+				var toErase byte
+				cnt := 0
+				isContinuationByte := true
+				for ; cnt < len(q.readBuf) && isContinuationByte; cnt++ {
+					toErase = q.readBuf[len(q.readBuf)-cnt-1]
+					isContinuationByte = l.termios.IEnabled(linux.IUTF8) && (toErase&0xc0) == 0x80
+				}
+				if isContinuationByte {
+					// Do not partially erase a multibyte unicode character.
+					break
+				}
+
+				// VWERASE will continue erasing characters until we encounter the first non-alphanumeric character
+				// that follows some alphanumeric character. We consider "_" to be alphanumeric.
+				if killType == linux.VWERASE {
+					if unicode.IsLetter(rune(toErase)) || unicode.IsDigit(rune(toErase)) || toErase == '_' {
+						seenAlphanumeric = true
+					} else if seenAlphanumeric {
+						break
+					}
+				}
+
+				q.readBuf = q.readBuf[:len(q.readBuf)-cnt]
+				if l.termios.LEnabled(linux.ECHO) {
+					if l.termios.LEnabled(linux.ECHOPRT) {
+						// Not implemented
+					} else if killType == linux.VERASE && !l.termios.LEnabled(linux.ECHOE) {
+						// Not implemented
+					} else if toErase == '\t' {
+						// Not implemented
+					} else {
+						const unicodeDelete byte = 0x7f
+						isCtrl := toErase < 0x20 || toErase == unicodeDelete
+						echoctl := l.termios.LEnabled(linux.ECHOCTL)
+
+						charsToDelete := 1
+						if isCtrl {
+							// echoctl controls how we echo control characters, which also determines how we delete them.
+							if echoctl {
+								// echoctl echoes control characters as ^X, so we need to erase two characters.
+								charsToDelete = 2
+							} else {
+								// if echoctl is disabled, we don't echo control characters so we don't have to erase anything.
+								charsToDelete = 0
+							}
+						}
+						for i := 0; i < charsToDelete; i++ {
+							// Linux's kernel does character deletion with this sequence
+							// of bytes, presumably because some older terminals don't erase
+							// characters with \b, so we need to "erase" the old character
+							// by writing a space over it.
+							l.outQueue.writeBytes([]byte{'\b', ' ', '\b'}, l)
+						}
+					}
+				}
+
+				// VERASE only erases a single character
+				if killType == linux.VERASE {
+					break
+				}
+			}
+
+			buf = buf[1:]
+			ret += 1
+			notifyEcho = true
+			continue
 		}
 
 		// In canonical mode, we discard non-terminating characters
@@ -441,8 +599,8 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 // we find a terminating character. Signal/echo processing still occurs.
 //
 // Precondition:
-// * l.termiosMu must be held for reading.
-// * q.mu must be held.
+//   - l.termiosMu must be held for reading.
+//   - q.mu must be held.
 func (l *lineDiscipline) shouldDiscard(q *queue, cBytes []byte) bool {
 	return l.termios.LEnabled(linux.ICANON) && len(q.readBuf)+len(cBytes) >= canonMaxBytes && !l.termios.IsTerminating(cBytes)
 }

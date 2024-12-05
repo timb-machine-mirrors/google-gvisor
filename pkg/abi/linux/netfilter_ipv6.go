@@ -15,6 +15,8 @@
 package linux
 
 import (
+	"math"
+
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 )
@@ -23,6 +25,24 @@ import (
 // ip6tables. Some constants and structs are equal to their IPv4 analogues, and
 // are only distinguished by context (e.g. whether used on an IPv4 of IPv6
 // socket).
+
+// Netfilter IPv6 Standard Hook Priorities, from uapi/linux/netfilter_ipv6.h.
+const (
+	NF_IP6_PRI_FIRST             = math.MinInt
+	NF_IP6_PRI_RAW_BEFORE_DEFRAG = -450
+	NF_IP6_PRI_CONNTRACK_DEFRAG  = -400
+	NF_IP6_PRI_RAW               = -300
+	NF_IP6_PRI_SELINUX_FIRST     = -225
+	NF_IP6_PRI_CONNTRACK         = -200
+	NF_IP6_PRI_MANGLE            = -150
+	NF_IP6_PRI_NAT_DST           = -100
+	NF_IP6_PRI_FILTER            = 0
+	NF_IP6_PRI_SECURITY          = 50
+	NF_IP6_PRI_NAT_SRC           = 100
+	NF_IP6_PRI_SELINUX_LAST      = 225
+	NF_IP6_PRI_CONNTRACK_HELPER  = 300
+	NF_IP6_PRI_LAST              = math.MaxInt
+)
 
 // Socket options for SOL_SOCLET. These correspond to values in
 // include/uapi/linux/netfilter_ipv6/ip6_tables.h.
@@ -84,23 +104,21 @@ func (ke *KernelIP6TGetEntries) SizeBytes() int {
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
-func (ke *KernelIP6TGetEntries) MarshalBytes(dst []byte) {
-	ke.IPTGetEntries.MarshalUnsafe(dst)
-	marshalledUntil := ke.IPTGetEntries.SizeBytes()
+func (ke *KernelIP6TGetEntries) MarshalBytes(dst []byte) []byte {
+	dst = ke.IPTGetEntries.MarshalUnsafe(dst)
 	for i := range ke.Entrytable {
-		ke.Entrytable[i].MarshalBytes(dst[marshalledUntil:])
-		marshalledUntil += ke.Entrytable[i].SizeBytes()
+		dst = ke.Entrytable[i].MarshalBytes(dst)
 	}
+	return dst
 }
 
 // UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
-func (ke *KernelIP6TGetEntries) UnmarshalBytes(src []byte) {
-	ke.IPTGetEntries.UnmarshalUnsafe(src)
-	unmarshalledUntil := ke.IPTGetEntries.SizeBytes()
+func (ke *KernelIP6TGetEntries) UnmarshalBytes(src []byte) []byte {
+	src = ke.IPTGetEntries.UnmarshalUnsafe(src)
 	for i := range ke.Entrytable {
-		ke.Entrytable[i].UnmarshalBytes(src[unmarshalledUntil:])
-		unmarshalledUntil += ke.Entrytable[i].SizeBytes()
+		src = ke.Entrytable[i].UnmarshalBytes(src)
 	}
+	return src
 }
 
 var _ marshal.Marshallable = (*KernelIP6TGetEntries)(nil)
@@ -166,16 +184,18 @@ func (ke *KernelIP6TEntry) SizeBytes() int {
 }
 
 // MarshalBytes implements marshal.Marshallable.MarshalBytes.
-func (ke *KernelIP6TEntry) MarshalBytes(dst []byte) {
-	ke.Entry.MarshalUnsafe(dst)
-	ke.Elems.MarshalBytes(dst[ke.Entry.SizeBytes():])
+func (ke *KernelIP6TEntry) MarshalBytes(dst []byte) []byte {
+	dst = ke.Entry.MarshalUnsafe(dst)
+	return ke.Elems.MarshalBytes(dst)
 }
 
 // UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
-func (ke *KernelIP6TEntry) UnmarshalBytes(src []byte) {
-	ke.Entry.UnmarshalUnsafe(src)
-	ke.Elems.UnmarshalBytes(src[ke.Entry.SizeBytes():])
+func (ke *KernelIP6TEntry) UnmarshalBytes(src []byte) []byte {
+	src = ke.Entry.UnmarshalUnsafe(src)
+	return ke.Elems.UnmarshalBytes(src)
 }
+
+var _ marshal.Marshallable = (*KernelIP6TEntry)(nil)
 
 // IP6TIP contains information for matching a packet's IP header.
 // It corresponds to struct ip6t_ip6 in
@@ -236,7 +256,7 @@ const (
 	IP6T_F_PROTO = 0x01
 	// Whether to match the TOS field.
 	IP6T_F_TOS = 0x02
-	// Indicates that the jump target is an aboslute GOTO, not an offset.
+	// Indicates that the jump target is an absolute GOTO, not an offset.
 	IP6T_F_GOTO = 0x04
 	// Enables all flags.
 	IP6T_F_MASK = 0x07
@@ -275,3 +295,20 @@ type NFNATRange struct {
 
 // SizeOfNFNATRange is the size of NFNATRange.
 const SizeOfNFNATRange = 40
+
+// NFNATRange2 corresponds to struct nf_nat_range2 in
+// include/uapi/linux/netfilter/nf_nat.h.
+//
+// +marshal
+type NFNATRange2 struct {
+	Flags     uint32
+	MinAddr   Inet6Addr
+	MaxAddr   Inet6Addr
+	MinProto  uint16 // Network byte order.
+	MaxProto  uint16 // Network byte order.
+	BaseProto uint16 // Network byte order.
+	_         [6]byte
+}
+
+// SizeOfNFNATRange2 is the size of NFNATRange2.
+const SizeOfNFNATRange2 = 48

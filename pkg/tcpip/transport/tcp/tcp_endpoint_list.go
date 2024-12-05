@@ -13,7 +13,7 @@ type endpointElementMapper struct{}
 // This default implementation should be inlined.
 //
 //go:nosplit
-func (endpointElementMapper) linkerFor(elem *endpoint) *endpoint { return elem }
+func (endpointElementMapper) linkerFor(elem *Endpoint) *Endpoint { return elem }
 
 // List is an intrusive list. Entries can be added to or removed from the list
 // in O(1) time and with no additional memory allocations.
@@ -21,14 +21,15 @@ func (endpointElementMapper) linkerFor(elem *endpoint) *endpoint { return elem }
 // The zero value for List is an empty list ready to use.
 //
 // To iterate over a list (where l is a List):
-//      for e := l.Front(); e != nil; e = e.Next() {
-// 		// do something with e.
-//      }
+//
+//	for e := l.Front(); e != nil; e = e.Next() {
+//		// do something with e.
+//	}
 //
 // +stateify savable
 type endpointList struct {
-	head *endpoint
-	tail *endpoint
+	head *Endpoint
+	tail *Endpoint
 }
 
 // Reset resets list l to the empty state.
@@ -47,14 +48,14 @@ func (l *endpointList) Empty() bool {
 // Front returns the first element of list l or nil.
 //
 //go:nosplit
-func (l *endpointList) Front() *endpoint {
+func (l *endpointList) Front() *Endpoint {
 	return l.head
 }
 
 // Back returns the last element of list l or nil.
 //
 //go:nosplit
-func (l *endpointList) Back() *endpoint {
+func (l *endpointList) Back() *Endpoint {
 	return l.tail
 }
 
@@ -73,7 +74,7 @@ func (l *endpointList) Len() (count int) {
 // PushFront inserts the element e at the front of list l.
 //
 //go:nosplit
-func (l *endpointList) PushFront(e *endpoint) {
+func (l *endpointList) PushFront(e *Endpoint) {
 	linker := endpointElementMapper{}.linkerFor(e)
 	linker.SetNext(l.head)
 	linker.SetPrev(nil)
@@ -86,10 +87,27 @@ func (l *endpointList) PushFront(e *endpoint) {
 	l.head = e
 }
 
+// PushFrontList inserts list m at the start of list l, emptying m.
+//
+//go:nosplit
+func (l *endpointList) PushFrontList(m *endpointList) {
+	if l.head == nil {
+		l.head = m.head
+		l.tail = m.tail
+	} else if m.head != nil {
+		endpointElementMapper{}.linkerFor(l.head).SetPrev(m.tail)
+		endpointElementMapper{}.linkerFor(m.tail).SetNext(l.head)
+
+		l.head = m.head
+	}
+	m.head = nil
+	m.tail = nil
+}
+
 // PushBack inserts the element e at the back of list l.
 //
 //go:nosplit
-func (l *endpointList) PushBack(e *endpoint) {
+func (l *endpointList) PushBack(e *Endpoint) {
 	linker := endpointElementMapper{}.linkerFor(e)
 	linker.SetNext(nil)
 	linker.SetPrev(l.tail)
@@ -122,7 +140,7 @@ func (l *endpointList) PushBackList(m *endpointList) {
 // InsertAfter inserts e after b.
 //
 //go:nosplit
-func (l *endpointList) InsertAfter(b, e *endpoint) {
+func (l *endpointList) InsertAfter(b, e *Endpoint) {
 	bLinker := endpointElementMapper{}.linkerFor(b)
 	eLinker := endpointElementMapper{}.linkerFor(e)
 
@@ -142,7 +160,7 @@ func (l *endpointList) InsertAfter(b, e *endpoint) {
 // InsertBefore inserts e before a.
 //
 //go:nosplit
-func (l *endpointList) InsertBefore(a, e *endpoint) {
+func (l *endpointList) InsertBefore(a, e *Endpoint) {
 	aLinker := endpointElementMapper{}.linkerFor(a)
 	eLinker := endpointElementMapper{}.linkerFor(e)
 
@@ -161,7 +179,7 @@ func (l *endpointList) InsertBefore(a, e *endpoint) {
 // Remove removes e from l.
 //
 //go:nosplit
-func (l *endpointList) Remove(e *endpoint) {
+func (l *endpointList) Remove(e *Endpoint) {
 	linker := endpointElementMapper{}.linkerFor(e)
 	prev := linker.Prev()
 	next := linker.Next()
@@ -188,34 +206,34 @@ func (l *endpointList) Remove(e *endpoint) {
 //
 // +stateify savable
 type endpointEntry struct {
-	next *endpoint
-	prev *endpoint
+	next *Endpoint
+	prev *Endpoint
 }
 
 // Next returns the entry that follows e in the list.
 //
 //go:nosplit
-func (e *endpointEntry) Next() *endpoint {
+func (e *endpointEntry) Next() *Endpoint {
 	return e.next
 }
 
 // Prev returns the entry that precedes e in the list.
 //
 //go:nosplit
-func (e *endpointEntry) Prev() *endpoint {
+func (e *endpointEntry) Prev() *Endpoint {
 	return e.prev
 }
 
 // SetNext assigns 'entry' as the entry that follows e in the list.
 //
 //go:nosplit
-func (e *endpointEntry) SetNext(elem *endpoint) {
+func (e *endpointEntry) SetNext(elem *Endpoint) {
 	e.next = elem
 }
 
 // SetPrev assigns 'entry' as the entry that precedes e in the list.
 //
 //go:nosplit
-func (e *endpointEntry) SetPrev(elem *endpoint) {
+func (e *endpointEntry) SetPrev(elem *Endpoint) {
 	e.prev = elem
 }

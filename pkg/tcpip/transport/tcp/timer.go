@@ -15,18 +15,18 @@
 package tcp
 
 import (
-	"math"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
 type timerState int
 
 const (
+	// The timer has not been initialized yet or has been cleaned up.
+	timerUninitialized timerState = iota
 	// The timer is disabled.
-	timerStateDisabled timerState = iota
+	timerStateDisabled
 	// The timer is enabled, but the clock timer may be set to an earlier
 	// expiration time due to a previous orphaned state.
 	timerStateEnabled
@@ -67,20 +67,17 @@ type timer struct {
 
 	// timer is the clock timer used to wait on.
 	timer tcpip.Timer
+
+	// callback is the function that's called when the timer expires.
+	callback func()
 }
 
-// init initializes the timer. Once it expires, it the given waker will be
-// asserted.
-func (t *timer) init(clock tcpip.Clock, w *sleep.Waker) {
+// init initializes the timer. Once it expires the function callback
+// passed will be called.
+func (t *timer) init(clock tcpip.Clock, f func()) {
 	t.state = timerStateDisabled
 	t.clock = clock
-
-	// Initialize a clock timer that will assert the waker, then
-	// immediately stop it.
-	t.timer = t.clock.AfterFunc(math.MaxInt64, func() {
-		w.Assert()
-	})
-	t.timer.Stop()
+	t.callback = f
 }
 
 // cleanup frees all resources associated with the timer.
@@ -93,10 +90,16 @@ func (t *timer) cleanup() {
 	*t = timer{}
 }
 
+// isUninitialized returns true if the timer is in the uninitialized state. This
+// is only true if init() has never been called or if cleanup has been called.
+func (t *timer) isUninitialized() bool {
+	return t.state == timerUninitialized
+}
+
 // checkExpiration checks if the given timer has actually expired, it should be
-// called whenever a sleeper wakes up due to the waker being asserted, and is
-// used to check if it's a supurious wake (due to a previously orphaned timer)
-// or a legitimate one.
+// called whenever the callback function is called, and is used to check if it's
+// a spurious timer expiration (due to a previously orphaned timer) or a
+// legitimate one.
 func (t *timer) checkExpiration() bool {
 	// Transition to fully disabled state if we're just consuming an
 	// orphaned timer.
@@ -140,8 +143,18 @@ func (t *timer) enable(d time.Duration) {
 	// Check if we need to set the runtime timer.
 	if t.state == timerStateDisabled || t.target.Before(t.clockTarget) {
 		t.clockTarget = t.target
-		t.timer.Reset(d)
+		t.resetOrStart(d)
 	}
 
 	t.state = timerStateEnabled
+}
+
+// resetOrStart creates the timer if it doesn't already exist or resets it with
+// the given duration if it does.
+func (t *timer) resetOrStart(d time.Duration) {
+	if t.timer == nil {
+		t.timer = t.clock.AfterFunc(d, t.callback)
+	} else {
+		t.timer.Reset(d)
+	}
 }

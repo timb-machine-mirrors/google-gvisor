@@ -21,11 +21,11 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/syserror"
 )
 
 const (
@@ -41,8 +41,10 @@ type tasksInode struct {
 	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 	tasksInodeRefs
 
@@ -62,31 +64,39 @@ type tasksInode struct {
 
 var _ kernfs.Inode = (*tasksInode)(nil)
 
-func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns *kernel.PIDNamespace, fakeCgroupControllers map[string]string) *tasksInode {
+func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns *kernel.PIDNamespace, internalData *InternalData) *tasksInode {
 	root := auth.NewRootCredentials(pidns.UserNamespace())
+
 	contents := map[string]kernfs.Inode{
-		"cmdline":     fs.newInode(ctx, root, 0444, &cmdLineData{}),
-		"cpuinfo":     fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
-		"filesystems": fs.newInode(ctx, root, 0444, &filesystemsData{}),
-		"loadavg":     fs.newInode(ctx, root, 0444, &loadavgData{}),
-		"sys":         fs.newSysDir(ctx, root, k),
-		"meminfo":     fs.newInode(ctx, root, 0444, &meminfoData{}),
-		"mounts":      kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
-		"net":         kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
-		"stat":        fs.newInode(ctx, root, 0444, &statData{}),
-		"uptime":      fs.newInode(ctx, root, 0444, &uptimeData{}),
-		"version":     fs.newInode(ctx, root, 0444, &versionData{}),
+		"cmdline":        fs.newInode(ctx, root, 0444, &cmdLineData{}),
+		"cpuinfo":        fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
+		"filesystems":    fs.newInode(ctx, root, 0444, &filesystemsData{}),
+		"loadavg":        fs.newInode(ctx, root, 0444, &loadavgData{}),
+		"sys":            fs.newSysDir(ctx, root, k),
+		"bus":            fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"fs":             fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"irq":            fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"meminfo":        fs.newInode(ctx, root, 0444, &meminfoData{}),
+		"mounts":         kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
+		"net":            kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
+		"sentry-meminfo": fs.newInode(ctx, root, 0444, &sentryMeminfoData{}),
+		"stat":           fs.newInode(ctx, root, 0444, &statData{}),
+		"sysrq-trigger":  fs.newInode(ctx, root, 0200, newStaticFile("")),
+		"uptime":         fs.newInode(ctx, root, 0444, &uptimeData{}),
+		"version":        fs.newInode(ctx, root, 0444, &versionData{}),
 	}
 	// If fakeCgroupControllers are provided, don't create a cgroupfs backed
 	// /proc/cgroup as it will not match the fake controllers.
-	if len(fakeCgroupControllers) == 0 {
+	if len(internalData.Cgroups) == 0 {
 		contents["cgroups"] = fs.newInode(ctx, root, 0444, &cgroupsData{})
 	}
+
+	fs.newTasksInodeExtra(ctx, root, internalData, k, contents)
 
 	inode := &tasksInode{
 		pidns:                 pidns,
 		fs:                    fs,
-		fakeCgroupControllers: fakeCgroupControllers,
+		fakeCgroupControllers: internalData.Cgroups,
 	}
 	inode.InodeAttrs.Init(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
 	inode.InitRefs()
@@ -116,12 +126,12 @@ func (i *tasksInode) Lookup(ctx context.Context, name string) (kernfs.Inode, err
 		case threadSelfName:
 			return i.newThreadSelfSymlink(ctx, root), nil
 		}
-		return nil, syserror.ENOENT
+		return nil, linuxerr.ENOENT
 	}
 
 	task := i.pidns.TaskWithID(kernel.ThreadID(tid))
 	if task == nil {
-		return nil, syserror.ENOENT
+		return nil, linuxerr.ENOENT
 	}
 
 	return i.fs.newTaskInode(ctx, task, i.pidns, true, i.fakeCgroupControllers)
@@ -257,17 +267,13 @@ func newStaticFileSetStat(data string) *staticFileSetStat {
 
 func cpuInfoData(k *kernel.Kernel) string {
 	features := k.FeatureSet()
-	if features == nil {
-		// Kernel is always initialized with a FeatureSet.
-		panic("cpuinfo read with nil FeatureSet")
-	}
 	var buf bytes.Buffer
 	for i, max := uint(0), k.ApplicationCores(); i < max; i++ {
-		features.WriteCPUInfoTo(i, &buf)
+		features.WriteCPUInfoTo(i, max, &buf)
 	}
 	return buf.String()
 }
 
-func shmData(v uint64) dynamicInode {
+func ipcData(v uint64) dynamicInode {
 	return newStaticFile(strconv.FormatUint(v, 10))
 }

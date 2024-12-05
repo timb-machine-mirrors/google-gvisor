@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build (amd64 || 386) && go1.1
+//go:build (amd64 || 386) && !false
 // +build amd64 386
-// +build go1.1
+// +build !false
 
 package arch
 
 import (
-	"gvisor.dev/gvisor/pkg/cpuid"
+	"context"
+
 	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 )
 
@@ -33,12 +34,9 @@ type State struct {
 
 	// Our floating point state.
 	fpState fpu.State `state:"wait"`
-
-	// FeatureSet is a pointer to the currently active feature set.
-	FeatureSet *cpuid.FeatureSet
 }
 
 // afterLoad is invoked by stateify.
-func (s *State) afterLoad() {
+func (s *State) afterLoad(context.Context) {
 	s.afterLoadFPState()
 }

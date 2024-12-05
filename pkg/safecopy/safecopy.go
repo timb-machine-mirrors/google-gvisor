@@ -21,7 +21,9 @@ import (
 	"runtime"
 
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/errors"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/sighandling"
 )
 
 // SegvError is returned when a safecopy function receives SIGSEGV.
@@ -82,7 +84,7 @@ var (
 	// when we get a SIGSEGV that is not interesting to us.
 	savedSigSegVHandler uintptr
 
-	// same a above, but for SIGBUS signals.
+	// Same as above, but for SIGBUS signals.
 	savedSigBusHandler uintptr
 )
 
@@ -127,22 +129,23 @@ func initializeAddresses() {
 	compareAndSwapUint32End = FindEndAddress(compareAndSwapUint32Begin)
 	loadUint32Begin = addrOfLoadUint32()
 	loadUint32End = FindEndAddress(loadUint32Begin)
+	initializeArchAddresses()
 }
 
 func init() {
 	initializeAddresses()
-	if err := ReplaceSignalHandler(unix.SIGSEGV, addrOfSignalHandler(), &savedSigSegVHandler); err != nil {
+	if err := sighandling.ReplaceSignalHandler(unix.SIGSEGV, addrOfSignalHandler(), &savedSigSegVHandler); err != nil {
 		panic(fmt.Sprintf("Unable to set handler for SIGSEGV: %v", err))
 	}
-	if err := ReplaceSignalHandler(unix.SIGBUS, addrOfSignalHandler(), &savedSigBusHandler); err != nil {
+	if err := sighandling.ReplaceSignalHandler(unix.SIGBUS, addrOfSignalHandler(), &savedSigBusHandler); err != nil {
 		panic(fmt.Sprintf("Unable to set handler for SIGBUS: %v", err))
 	}
-	syserror.AddErrorUnwrapper(func(e error) (unix.Errno, bool) {
+	linuxerr.AddErrorUnwrapper(func(e error) (*errors.Error, bool) {
 		switch e.(type) {
 		case SegvError, BusError, AlignmentError:
-			return unix.EFAULT, true
+			return linuxerr.EFAULT, true
 		default:
-			return 0, false
+			return nil, false
 		}
 	})
 }

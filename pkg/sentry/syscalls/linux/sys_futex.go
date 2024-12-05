@@ -22,8 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
-	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 )
 
 // futexWaitRestartBlock encapsulates the state required to restart futex(2)
@@ -62,20 +61,13 @@ func futexWaitAbsolute(t *kernel.Task, clockRealtime bool, ts linux.Timespec, fo
 	if forever {
 		err = t.Block(w.C)
 	} else if clockRealtime {
-		notifier, tchan := ktime.NewChannelNotifier()
-		timer := ktime.NewTimer(t.Kernel().RealtimeClock(), notifier)
-		timer.Swap(ktime.Setting{
-			Enabled: true,
-			Next:    ktime.FromTimespec(ts),
-		})
-		err = t.BlockWithTimer(w.C, tchan)
-		timer.Destroy()
+		err = t.BlockWithDeadlineFrom(w.C, t.Kernel().RealtimeClock(), true, ktime.FromTimespec(ts))
 	} else {
 		err = t.BlockWithDeadline(w.C, true, ktime.FromTimespec(ts))
 	}
 
 	t.Futex().WaitComplete(w, t)
-	return 0, syserror.ConvertIntr(err, syserror.ERESTARTSYS)
+	return 0, linuxerr.ConvertIntr(err, linuxerr.ERESTARTSYS)
 }
 
 // futexWaitDuration performs a FUTEX_WAIT, blocking until the wait is
@@ -103,7 +95,7 @@ func futexWaitDuration(t *kernel.Task, duration time.Duration, forever bool, add
 
 	// The wait was unsuccessful for some reason other than interruption. Simply
 	// forward the error.
-	if err != syserror.ErrInterrupted {
+	if err != linuxerr.ErrInterrupted {
 		return 0, err
 	}
 
@@ -111,7 +103,7 @@ func futexWaitDuration(t *kernel.Task, duration time.Duration, forever bool, add
 
 	// The wait duration was absolute, restart with the original arguments.
 	if forever {
-		return 0, syserror.ERESTARTSYS
+		return 0, linuxerr.ERESTARTSYS
 	}
 
 	// The wait duration was relative, restart with the remaining duration.
@@ -122,7 +114,7 @@ func futexWaitDuration(t *kernel.Task, duration time.Duration, forever bool, add
 		val:      val,
 		mask:     mask,
 	})
-	return 0, syserror.ERESTART_RESTARTBLOCK
+	return 0, linuxerr.ERESTART_RESTARTBLOCK
 }
 
 func futexLockPI(t *kernel.Task, ts linux.Timespec, forever bool, addr hostarch.Addr, private bool) error {
@@ -139,18 +131,11 @@ func futexLockPI(t *kernel.Task, ts linux.Timespec, forever bool, addr hostarch.
 	if forever {
 		err = t.Block(w.C)
 	} else {
-		notifier, tchan := ktime.NewChannelNotifier()
-		timer := ktime.NewTimer(t.Kernel().RealtimeClock(), notifier)
-		timer.Swap(ktime.Setting{
-			Enabled: true,
-			Next:    ktime.FromTimespec(ts),
-		})
-		err = t.BlockWithTimer(w.C, tchan)
-		timer.Destroy()
+		err = t.BlockWithDeadlineFrom(w.C, t.Kernel().RealtimeClock(), true, ktime.FromTimespec(ts))
 	}
 
 	t.Futex().WaitComplete(w, t)
-	return syserror.ConvertIntr(err, syserror.ERESTARTSYS)
+	return linuxerr.ConvertIntr(err, linuxerr.ERESTARTSYS)
 }
 
 func tryLockPI(t *kernel.Task, addr hostarch.Addr, private bool) error {
@@ -168,7 +153,7 @@ func tryLockPI(t *kernel.Task, addr hostarch.Addr, private bool) error {
 // Futex implements linux syscall futex(2).
 // It provides a method for a program to wait for a value at a given address to
 // change, and a method to wake up anyone waiting on a particular address.
-func Futex(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Futex(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
 	futexOp := args[1].Int()
 	val := int(args[2].Int())
@@ -279,17 +264,17 @@ func Futex(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		return 0, nil, err
 
 	case linux.FUTEX_WAIT_REQUEUE_PI, linux.FUTEX_CMP_REQUEUE_PI:
-		t.Kernel().EmitUnimplementedEvent(t)
-		return 0, nil, syserror.ENOSYS
+		t.Kernel().EmitUnimplementedEvent(t, sysno)
+		return 0, nil, linuxerr.ENOSYS
 
 	default:
 		// We don't even know about this command.
-		return 0, nil, syserror.ENOSYS
+		return 0, nil, linuxerr.ENOSYS
 	}
 }
 
 // SetRobustList implements linux syscall set_robust_list(2).
-func SetRobustList(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func SetRobustList(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	// Despite the syscall using the name 'pid' for this variable, it is
 	// very much a tid.
 	head := args[0].Pointer()
@@ -303,7 +288,7 @@ func SetRobustList(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel
 }
 
 // GetRobustList implements linux syscall get_robust_list(2).
-func GetRobustList(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func GetRobustList(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	// Despite the syscall using the name 'pid' for this variable, it is
 	// very much a tid.
 	tid := args[0].Int()

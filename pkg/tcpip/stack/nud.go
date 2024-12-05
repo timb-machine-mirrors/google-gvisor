@@ -165,6 +165,8 @@ type ReachabilityConfirmationFlags struct {
 // NUDConfigurations is the NUD configurations for the netstack. This is used
 // by the neighbor cache to operate the NUD state machine on each device in the
 // local network.
+//
+// +stateify savable
 type NUDConfigurations struct {
 	// BaseReachableTime is the base duration for computing the random reachable
 	// time.
@@ -314,26 +316,31 @@ func calcMaxRandomFactor(minRandomFactor float32) float32 {
 	return defaultMaxRandomFactor
 }
 
+// +stateify savable
+type nudStateMu struct {
+	sync.RWMutex `state:"nosave"`
+
+	config NUDConfigurations
+
+	// reachableTime is the duration to wait for a REACHABLE entry to
+	// transition into STALE after inactivity. This value is calculated with
+	// the algorithm defined in RFC 4861 section 6.3.2.
+	reachableTime time.Duration
+
+	expiration            tcpip.MonotonicTime
+	prevBaseReachableTime time.Duration
+	prevMinRandomFactor   float32
+	prevMaxRandomFactor   float32
+}
+
 // NUDState stores states needed for calculating reachable time.
+//
+// +stateify savable
 type NUDState struct {
 	clock tcpip.Clock
-	rng   *rand.Rand
-
-	mu struct {
-		sync.RWMutex
-
-		config NUDConfigurations
-
-		// reachableTime is the duration to wait for a REACHABLE entry to
-		// transition into STALE after inactivity. This value is calculated with
-		// the algorithm defined in RFC 4861 section 6.3.2.
-		reachableTime time.Duration
-
-		expiration            time.Time
-		prevBaseReachableTime time.Duration
-		prevMinRandomFactor   float32
-		prevMaxRandomFactor   float32
-	}
+	// TODO(b/341946753): Restore when netstack is savable.
+	rng *rand.Rand `state:"nosave"`
+	mu  nudStateMu
 }
 
 // NewNUDState returns new NUDState using c as configuration and the specified
@@ -369,7 +376,7 @@ func (s *NUDState) ReachableTime() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.clock.Now().After(s.mu.expiration) ||
+	if s.clock.NowMonotonic().After(s.mu.expiration) ||
 		s.mu.config.BaseReachableTime != s.mu.prevBaseReachableTime ||
 		s.mu.config.MinRandomFactor != s.mu.prevMinRandomFactor ||
 		s.mu.config.MaxRandomFactor != s.mu.prevMaxRandomFactor {
@@ -384,19 +391,19 @@ func (s *NUDState) ReachableTime() time.Duration {
 // This SHOULD automatically be invoked during certain situations, as per
 // RFC 4861 section 6.3.4:
 //
-//    If the received Reachable Time value is non-zero, the host SHOULD set its
-//    BaseReachableTime variable to the received value.  If the new value
-//    differs from the previous value, the host SHOULD re-compute a new random
-//    ReachableTime value.  ReachableTime is computed as a uniformly
-//    distributed random value between MIN_RANDOM_FACTOR and MAX_RANDOM_FACTOR
-//    times the BaseReachableTime.  Using a random component eliminates the
-//    possibility that Neighbor Unreachability Detection messages will
-//    synchronize with each other.
+//	If the received Reachable Time value is non-zero, the host SHOULD set its
+//	BaseReachableTime variable to the received value.  If the new value
+//	differs from the previous value, the host SHOULD re-compute a new random
+//	ReachableTime value.  ReachableTime is computed as a uniformly
+//	distributed random value between MIN_RANDOM_FACTOR and MAX_RANDOM_FACTOR
+//	times the BaseReachableTime.  Using a random component eliminates the
+//	possibility that Neighbor Unreachability Detection messages will
+//	synchronize with each other.
 //
-//    In most cases, the advertised Reachable Time value will be the same in
-//    consecutive Router Advertisements, and a host's BaseReachableTime rarely
-//    changes.  In such cases, an implementation SHOULD ensure that a new
-//    random value gets re-computed at least once every few hours.
+//	In most cases, the advertised Reachable Time value will be the same in
+//	consecutive Router Advertisements, and a host's BaseReachableTime rarely
+//	changes.  In such cases, an implementation SHOULD ensure that a new
+//	random value gets re-computed at least once every few hours.
 //
 // s.mu MUST be locked for writing.
 func (s *NUDState) recomputeReachableTimeLocked() {
@@ -418,5 +425,5 @@ func (s *NUDState) recomputeReachableTimeLocked() {
 		s.mu.reachableTime = time.Duration(reachableTime)
 	}
 
-	s.mu.expiration = s.clock.Now().Add(2 * time.Hour)
+	s.mu.expiration = s.clock.NowMonotonic().Add(2 * time.Hour)
 }

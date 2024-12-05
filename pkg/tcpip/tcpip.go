@@ -19,7 +19,7 @@
 // The starting point is the creation and configuration of a stack. A stack can
 // be created by calling the New() function of the tcpip/stack/stack package;
 // configuring a stack involves creating NICs (via calls to Stack.CreateNIC()),
-// adding network addresses (via calls to Stack.AddAddress()), and
+// adding network addresses (via calls to Stack.AddProtocolAddress()), and
 // setting a route table (via a call to Stack.SetRouteTable()).
 //
 // Once a stack is configured, endpoints can be created by calling
@@ -33,19 +33,38 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/bits"
+	"net"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-// Using header.IPv4AddressSize would cause an import cycle.
-const ipv4AddressSize = 4
+// Using the header package here would cause an import cycle.
+const (
+	ipv4AddressSize    = 4
+	ipv4ProtocolNumber = 0x0800
+	ipv6AddressSize    = 16
+	ipv6ProtocolNumber = 0x86dd
+)
+
+const (
+	// LinkAddressSize is the size of a MAC address.
+	LinkAddressSize = 6
+)
+
+// Known IP address.
+var (
+	IPv4Zero = []byte{0, 0, 0, 0}
+	IPv6Zero = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+)
 
 // Errors related to Subnet
 var (
@@ -71,6 +90,17 @@ type MonotonicTime struct {
 	nanoseconds int64
 }
 
+// String implements Stringer.
+func (mt MonotonicTime) String() string {
+	return strconv.FormatInt(mt.nanoseconds, 10)
+}
+
+// MonotonicTimeInfinite returns the monotonic timestamp as far away in the
+// future as possible.
+func MonotonicTimeInfinite() MonotonicTime {
+	return MonotonicTime{nanoseconds: math.MaxInt64}
+}
+
 // Before reports whether the monotonic clock reading mt is before u.
 func (mt MonotonicTime) Before(u MonotonicTime) bool {
 	return mt.nanoseconds < u.nanoseconds
@@ -93,6 +123,11 @@ func (mt MonotonicTime) Add(d time.Duration) MonotonicTime {
 // will be returned. To compute t-d for a duration d, use t.Add(-d).
 func (mt MonotonicTime) Sub(u MonotonicTime) time.Duration {
 	return time.Unix(0, mt.nanoseconds).Sub(time.Unix(0, u.nanoseconds))
+}
+
+// Milliseconds returns the time in milliseconds.
+func (mt MonotonicTime) Milliseconds() int64 {
+	return mt.nanoseconds / 1e6
 }
 
 // A Clock provides the current time and schedules work for execution.
@@ -134,24 +169,127 @@ type Timer interface {
 
 // Address is a byte slice cast as a string that represents the address of a
 // network node. Or, in the case of unix endpoints, it may represent a path.
-type Address string
+//
+// +stateify savable
+type Address struct {
+	addr   [16]byte
+	length int
+}
+
+// AddrFrom4 converts addr to an Address.
+func AddrFrom4(addr [4]byte) Address {
+	ret := Address{
+		length: 4,
+	}
+	// It's guaranteed that copy will return 4.
+	copy(ret.addr[:], addr[:])
+	return ret
+}
+
+// AddrFrom4Slice converts addr to an Address. It panics if len(addr) != 4.
+func AddrFrom4Slice(addr []byte) Address {
+	if len(addr) != 4 {
+		panic(fmt.Sprintf("bad address length for address %v", addr))
+	}
+	ret := Address{
+		length: 4,
+	}
+	// It's guaranteed that copy will return 4.
+	copy(ret.addr[:], addr)
+	return ret
+}
+
+// AddrFrom16 converts addr to an Address.
+func AddrFrom16(addr [16]byte) Address {
+	ret := Address{
+		length: 16,
+	}
+	// It's guaranteed that copy will return 16.
+	copy(ret.addr[:], addr[:])
+	return ret
+}
+
+// AddrFrom16Slice converts addr to an Address. It panics if len(addr) != 16.
+func AddrFrom16Slice(addr []byte) Address {
+	if len(addr) != 16 {
+		panic(fmt.Sprintf("bad address length for address %v", addr))
+	}
+	ret := Address{
+		length: 16,
+	}
+	// It's guaranteed that copy will return 16.
+	copy(ret.addr[:], addr)
+	return ret
+}
+
+// AddrFromSlice converts addr to an Address. It returns the Address zero value
+// if len(addr) != 4 or 16.
+func AddrFromSlice(addr []byte) Address {
+	switch len(addr) {
+	case ipv4AddressSize:
+		return AddrFrom4Slice(addr)
+	case ipv6AddressSize:
+		return AddrFrom16Slice(addr)
+	}
+	return Address{}
+}
+
+// As4 returns a as a 4 byte array. It panics if the address length is not 4.
+func (a Address) As4() [4]byte {
+	if a.Len() != 4 {
+		panic(fmt.Sprintf("bad address length for address %v", a.addr))
+	}
+	return [4]byte(a.addr[:4])
+}
+
+// As16 returns a as a 16 byte array. It panics if the address length is not 16.
+func (a Address) As16() [16]byte {
+	if a.Len() != 16 {
+		panic(fmt.Sprintf("bad address length for address %v", a.addr))
+	}
+	return [16]byte(a.addr[:16])
+}
+
+// AsSlice returns a as a byte slice. Callers should be careful as it can
+// return a window into existing memory.
+//
+// +checkescape
+func (a *Address) AsSlice() []byte {
+	return a.addr[:a.length]
+}
+
+// BitLen returns the length in bits of a.
+func (a Address) BitLen() int {
+	return a.Len() * 8
+}
+
+// Len returns the length in bytes of a.
+func (a Address) Len() int {
+	return a.length
+}
 
 // WithPrefix returns the address with a prefix that represents a point subnet.
 func (a Address) WithPrefix() AddressWithPrefix {
 	return AddressWithPrefix{
 		Address:   a,
-		PrefixLen: len(a) * 8,
+		PrefixLen: a.BitLen(),
 	}
 }
 
 // Unspecified returns true if the address is unspecified.
 func (a Address) Unspecified() bool {
-	for _, b := range a {
+	for _, b := range a.addr {
 		if b != 0 {
 			return false
 		}
 	}
 	return true
+}
+
+// Equal returns whether a and other are equal. It exists for use by the cmp
+// library.
+func (a Address) Equal(other Address) bool {
+	return a == other
 }
 
 // MatchingPrefix returns the matching prefix length in bits.
@@ -160,14 +298,14 @@ func (a Address) Unspecified() bool {
 func (a Address) MatchingPrefix(b Address) uint8 {
 	const bitsInAByte = 8
 
-	if len(a) != len(b) {
+	if a.Len() != b.Len() {
 		panic(fmt.Sprintf("addresses %s and %s do not have the same length", a, b))
 	}
 
 	var prefix uint8
-	for i := range a {
-		aByte := a[i]
-		bByte := b[i]
+	for i := 0; i < a.length; i++ {
+		aByte := a.addr[i]
+		bByte := b.addr[i]
 
 		if aByte == bByte {
 			prefix += bitsInAByte
@@ -193,23 +331,68 @@ func (a Address) MatchingPrefix(b Address) uint8 {
 }
 
 // AddressMask is a bitmask for an address.
-type AddressMask string
+//
+// +stateify savable
+type AddressMask struct {
+	mask   [16]byte
+	length int
+}
+
+// MaskFrom returns a Mask based on str.
+//
+// MaskFrom may allocate, and so should not be in hot paths.
+func MaskFrom(str string) AddressMask {
+	mask := AddressMask{length: len(str)}
+	copy(mask.mask[:], str)
+	return mask
+}
+
+// MaskFromBytes returns a Mask based on bs.
+func MaskFromBytes(bs []byte) AddressMask {
+	mask := AddressMask{length: len(bs)}
+	copy(mask.mask[:], bs)
+	return mask
+}
 
 // String implements Stringer.
 func (m AddressMask) String() string {
-	return Address(m).String()
+	return fmt.Sprintf("%x", m.mask)
+}
+
+// AsSlice returns a as a byte slice. Callers should be careful as it can
+// return a window into existing memory.
+func (m *AddressMask) AsSlice() []byte {
+	return []byte(m.mask[:m.length])
+}
+
+// BitLen returns the length of the mask in bits.
+func (m AddressMask) BitLen() int {
+	return m.length * 8
+}
+
+// Len returns the length of the mask in bytes.
+func (m AddressMask) Len() int {
+	return m.length
 }
 
 // Prefix returns the number of bits before the first host bit.
 func (m AddressMask) Prefix() int {
 	p := 0
-	for _, b := range []byte(m) {
+	for _, b := range m.mask[:m.length] {
 		p += bits.LeadingZeros8(^b)
 	}
 	return p
 }
 
+// Equal returns whether m and other are equal. It exists for use by the cmp
+// library.
+func (m AddressMask) Equal(other AddressMask) bool {
+	return m == other
+}
+
 // Subnet is a subnet defined by its address and mask.
+//
+// +stateify savable
 type Subnet struct {
 	address Address
 	mask    AddressMask
@@ -217,11 +400,11 @@ type Subnet struct {
 
 // NewSubnet creates a new Subnet, checking that the address and mask are the same length.
 func NewSubnet(a Address, m AddressMask) (Subnet, error) {
-	if len(a) != len(m) {
+	if a.Len() != m.Len() {
 		return Subnet{}, errSubnetLengthMismatch
 	}
-	for i := 0; i < len(a); i++ {
-		if a[i]&^m[i] != 0 {
+	for i := 0; i < a.Len(); i++ {
+		if a.addr[i]&^m.mask[i] != 0 {
 			return Subnet{}, errSubnetAddressMasked
 		}
 	}
@@ -236,11 +419,11 @@ func (s Subnet) String() string {
 // Contains returns true iff the address is of the same length and matches the
 // subnet address and mask.
 func (s *Subnet) Contains(a Address) bool {
-	if len(a) != len(s.address) {
+	if a.Len() != s.address.Len() {
 		return false
 	}
-	for i := 0; i < len(a); i++ {
-		if a[i]&s.mask[i] != s.address[i] {
+	for i := 0; i < a.Len(); i++ {
+		if a.addr[i]&s.mask.mask[i] != s.address.addr[i] {
 			return false
 		}
 	}
@@ -256,7 +439,7 @@ func (s *Subnet) ID() Address {
 // subnet mask.
 func (s *Subnet) Bits() (ones int, zeros int) {
 	ones = s.mask.Prefix()
-	return ones, len(s.mask)*8 - ones
+	return ones, s.mask.BitLen() - ones
 }
 
 // Prefix returns the number of bits before the first host bit.
@@ -271,17 +454,17 @@ func (s *Subnet) Mask() AddressMask {
 
 // Broadcast returns the subnet's broadcast address.
 func (s *Subnet) Broadcast() Address {
-	addr := []byte(s.address)
-	for i := range addr {
-		addr[i] |= ^s.mask[i]
+	addrCopy := s.address
+	for i := 0; i < addrCopy.Len(); i++ {
+		addrCopy.addr[i] |= ^s.mask.mask[i]
 	}
-	return Address(addr)
+	return addrCopy
 }
 
 // IsBroadcast returns true if the address is considered a broadcast address.
 func (s *Subnet) IsBroadcast(address Address) bool {
 	// Only IPv4 supports the notion of a broadcast address.
-	if len(address) != ipv4AddressSize {
+	if address.Len() != ipv4AddressSize {
 		return false
 	}
 
@@ -353,13 +536,16 @@ type FullAddress struct {
 	// This may not be used by all endpoint types.
 	NIC NICID
 
-	// Addr is the network or link layer address.
+	// Addr is the network address.
 	Addr Address
 
 	// Port is the transport port.
 	//
 	// This may not be used by all endpoint types.
 	Port uint16
+
+	// LinkAddr is the link layer address.
+	LinkAddr LinkAddress
 }
 
 // Payloader is an interface that provides data.
@@ -416,16 +602,37 @@ func (l *LimitedWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// A ControlMessages contains socket control messages for IP sockets.
+// SendableControlMessages contains socket control messages that can be written.
 //
 // +stateify savable
-type ControlMessages struct {
-	// HasTimestamp indicates whether Timestamp is valid/set.
-	HasTimestamp bool
+type SendableControlMessages struct {
+	// HasTTL indicates whether TTL is valid/set.
+	HasTTL bool
 
-	// Timestamp is the time (in ns) that the last packet used to create
-	// the read data was received.
-	Timestamp int64
+	// TTL is the IPv4 Time To Live of the associated packet.
+	TTL uint8
+
+	// HasHopLimit indicates whether HopLimit is valid/set.
+	HasHopLimit bool
+
+	// HopLimit is the IPv6 Hop Limit of the associated packet.
+	HopLimit uint8
+
+	// HasIPv6PacketInfo indicates whether IPv6PacketInfo is set.
+	HasIPv6PacketInfo bool
+
+	// IPv6PacketInfo holds interface and address data on an incoming packet.
+	IPv6PacketInfo IPv6PacketInfo
+}
+
+// ReceivableControlMessages contains socket control messages that can be
+// received.
+//
+// +stateify savable
+type ReceivableControlMessages struct {
+	// Timestamp is the time that the last packet used to create the read data
+	// was received.
+	Timestamp time.Time `state:".(int64)"`
 
 	// HasInq indicates whether Inq is valid/set.
 	HasInq bool
@@ -433,11 +640,26 @@ type ControlMessages struct {
 	// Inq is the number of bytes ready to be received.
 	Inq int32
 
-	// HasTOS indicates whether Tos is valid/set.
+	// HasTOS indicates whether TOS is valid/set.
 	HasTOS bool
 
 	// TOS is the IPv4 type of service of the associated packet.
 	TOS uint8
+
+	// HasTTL indicates whether TTL is valid/set.
+	HasTTL bool
+
+	// TTL is the IPv4 Time To Live of the associated packet.
+	TTL uint8
+
+	// HasHopLimit indicates whether HopLimit is valid/set.
+	HasHopLimit bool
+
+	// HopLimit is the IPv6 Hop Limit of the associated packet.
+	HopLimit uint8
+
+	// HasTimestamp indicates whether Timestamp is valid/set.
+	HasTimestamp bool
 
 	// HasTClass indicates whether TClass is valid/set.
 	HasTClass bool
@@ -450,6 +672,12 @@ type ControlMessages struct {
 
 	// PacketInfo holds interface and address data on an incoming packet.
 	PacketInfo IPPacketInfo
+
+	// HasIPv6PacketInfo indicates whether IPv6PacketInfo is set.
+	HasIPv6PacketInfo bool
+
+	// IPv6PacketInfo holds interface and address data on an incoming packet.
+	IPv6PacketInfo IPv6PacketInfo
 
 	// HasOriginalDestinationAddress indicates whether OriginalDstAddress is
 	// set.
@@ -465,10 +693,10 @@ type ControlMessages struct {
 
 // PacketOwner is used to get UID and GID of the packet.
 type PacketOwner interface {
-	// UID returns KUID of the packet.
+	// KUID returns KUID of the packet.
 	KUID() uint32
 
-	// GID returns KGID of the packet.
+	// KGID returns KGID of the packet.
 	KGID() uint32
 }
 
@@ -496,7 +724,7 @@ type ReadResult struct {
 	Total int
 
 	// ControlMessages is the control messages received.
-	ControlMessages ControlMessages
+	ControlMessages ReceivableControlMessages
 
 	// RemoteAddr is the remote address if ReadOptions.NeedAddr is true.
 	RemoteAddr FullAddress
@@ -640,6 +868,16 @@ type Endpoint interface {
 	SocketOptions() *SocketOptions
 }
 
+// EndpointWithPreflight is the interface implemented by endpoints that need
+// to expose the `Preflight` method for preparing the endpoint prior to
+// calling `Write`.
+type EndpointWithPreflight interface {
+	// Prepares the endpoint for writes using the provided WriteOptions,
+	// returning an error if the options were incompatible with the endpoint's
+	// current state.
+	Preflight(WriteOptions) Error
+}
+
 // LinkPacketInfo holds Link layer information for a received packet.
 //
 // +stateify savable
@@ -679,8 +917,11 @@ type WriteOptions struct {
 
 	// Atomic means that all data fetched from Payloader must be written to the
 	// endpoint. If Atomic is false, then data fetched from the Payloader may be
-	// discarded if available endpoint buffer space is unsufficient.
+	// discarded if available endpoint buffer space is insufficient.
 	Atomic bool
+
+	// ControlMessages contains optional overrides used when writing a packet.
+	ControlMessages SendableControlMessages
 }
 
 // SockOptInt represents socket options which values have the int type.
@@ -725,12 +966,19 @@ const (
 	// number of unread bytes in the output buffer should be returned.
 	SendQueueSizeOption
 
-	// TTLOption is used by SetSockOptInt/GetSockOptInt to control the
-	// default TTL/hop limit value for unicast messages. The default is
-	// protocol specific.
+	// IPv4TTLOption is used by SetSockOptInt/GetSockOptInt to control the default
+	// TTL value for unicast messages.
 	//
-	// A zero value indicates the default.
-	TTLOption
+	// The default is configured by DefaultTTLOption. A UseDefaultIPv4TTL value
+	// configures the endpoint to use the default.
+	IPv4TTLOption
+
+	// IPv6HopLimitOption is used by SetSockOptInt/GetSockOptInt to control the
+	// default hop limit value for unicast messages.
+	//
+	// The default is configured by DefaultTTLOption. A UseDefaultIPv6HopLimit
+	// value configures the endpoint to use the default.
+	IPv6HopLimitOption
 
 	// TCPSynCountOption is used by SetSockOptInt/GetSockOptInt to specify
 	// the number of SYN retransmits that TCP should send before aborting
@@ -744,12 +992,31 @@ const (
 	//
 	// NOTE: This option is currently only stubed out and is a no-op
 	TCPWindowClampOption
+
+	// IPv6Checksum is used to request the stack to populate and validate the IPv6
+	// checksum for transport level headers.
+	IPv6Checksum
 )
+
+const (
+	// UseDefaultIPv4TTL is the IPv4TTLOption value that configures an endpoint to
+	// use the default ttl currently configured by the IPv4 protocol (see
+	// DefaultTTLOption).
+	UseDefaultIPv4TTL = 0
+
+	// UseDefaultIPv6HopLimit is the IPv6HopLimitOption value that configures an
+	// endpoint to use the default hop limit currently configured by the IPv6
+	// protocol (see DefaultTTLOption).
+	UseDefaultIPv6HopLimit = -1
+)
+
+// PMTUDStrategy is the kind of PMTUD to perform.
+type PMTUDStrategy int
 
 const (
 	// PMTUDiscoveryWant is a setting of the MTUDiscoverOption to use
 	// per-route settings.
-	PMTUDiscoveryWant int = iota
+	PMTUDiscoveryWant PMTUDStrategy = iota
 
 	// PMTUDiscoveryDont is a setting of the MTUDiscoverOption to disable
 	// path MTU discovery.
@@ -842,6 +1109,8 @@ func (*TCPDelayEnabled) isGettableTransportProtocolOption() {}
 func (*TCPDelayEnabled) isSettableTransportProtocolOption() {}
 
 // TCPSendBufferSizeRangeOption is the send buffer size range for TCP.
+//
+// +stateify savable
 type TCPSendBufferSizeRangeOption struct {
 	Min     int
 	Default int
@@ -853,6 +1122,8 @@ func (*TCPSendBufferSizeRangeOption) isGettableTransportProtocolOption() {}
 func (*TCPSendBufferSizeRangeOption) isSettableTransportProtocolOption() {}
 
 // TCPReceiveBufferSizeRangeOption is the receive buffer size range for TCP.
+//
+// +stateify savable
 type TCPReceiveBufferSizeRangeOption struct {
 	Min     int
 	Default int
@@ -891,6 +1162,29 @@ type SettableSocketOption interface {
 	isSettableSocketOption()
 }
 
+// ICMPv6Filter specifies a filter for ICMPv6 types.
+//
+// +stateify savable
+type ICMPv6Filter struct {
+	// DenyType indicates if an ICMP type should be blocked.
+	//
+	// The ICMPv6 type field is 8 bits so there are up to 256 different ICMPv6
+	// types.
+	DenyType [8]uint32
+}
+
+// ShouldDeny returns true iff the ICMPv6 Type should be denied.
+func (f *ICMPv6Filter) ShouldDeny(icmpType uint8) bool {
+	const bitsInUint32 = 32
+	i := icmpType / bitsInUint32
+	b := icmpType % bitsInUint32
+	return f.DenyType[i]&(1<<b) != 0
+}
+
+func (*ICMPv6Filter) isGettableSocketOption() {}
+
+func (*ICMPv6Filter) isSettableSocketOption() {}
+
 // EndpointState represents the state of an endpoint.
 type EndpointState uint8
 
@@ -918,8 +1212,6 @@ const (
 )
 
 // TCPInfoOption is used by GetSockOpt to expose TCP statistics.
-//
-// TODO(b/64800844): Add and populate stat fields.
 type TCPInfoOption struct {
 	// RTT is the smoothed round trip time.
 	RTT time.Duration
@@ -1126,16 +1418,16 @@ func (*TCPTimeWaitReuseOption) isGettableTransportProtocolOption() {}
 func (*TCPTimeWaitReuseOption) isSettableTransportProtocolOption() {}
 
 const (
-	// TCPTimeWaitReuseDisabled indicates reuse of port bound by endponts in TIME-WAIT cannot
+	// TCPTimeWaitReuseDisabled indicates reuse of port bound by endpoints in TIME-WAIT cannot
 	// be reused for new connections.
 	TCPTimeWaitReuseDisabled TCPTimeWaitReuseOption = iota
 
-	// TCPTimeWaitReuseGlobal indicates reuse of port bound by endponts in TIME-WAIT can
+	// TCPTimeWaitReuseGlobal indicates reuse of port bound by endpoints in TIME-WAIT can
 	// be reused for new connections irrespective of the src/dest addresses.
 	TCPTimeWaitReuseGlobal
 
 	// TCPTimeWaitReuseLoopbackOnly indicates reuse of port bound by endpoint in TIME-WAIT can
-	// only be reused if the connection was a connection over loopback. i.e src/dest adddresses
+	// only be reused if the connection was a connection over loopback. i.e. src/dest addresses
 	// are loopback addresses.
 	TCPTimeWaitReuseLoopbackOnly
 )
@@ -1164,8 +1456,18 @@ type IPPacketInfo struct {
 	DestinationAddr Address
 }
 
+// IPv6PacketInfo is the message structure for IPV6_PKTINFO.
+//
+// +stateify savable
+type IPv6PacketInfo struct {
+	Addr Address
+	NIC  NICID
+}
+
 // SendBufferSizeOption is used by stack.(Stack*).Option/SetOption to
 // get/set the default, min and max send buffer sizes.
+//
+// +stateify savable
 type SendBufferSizeOption struct {
 	// Min is the minimum size for send buffer.
 	Min int
@@ -1179,6 +1481,8 @@ type SendBufferSizeOption struct {
 
 // ReceiveBufferSizeOption is used by stack.(Stack*).Option/SetOption to
 // get/set the default, min and max receive buffer sizes.
+//
+// +stateify savable
 type ReceiveBufferSizeOption struct {
 	// Min is the minimum size for send buffer.
 	Min int
@@ -1217,7 +1521,11 @@ func GetStackReceiveBufferLimits(so StackHandler) ReceiveBufferSizeOption {
 // Route is a row in the routing table. It specifies through which NIC (and
 // gateway) sets of packets should be routed. A row is considered viable if the
 // masked target address matches the destination address in the row.
+//
+// +stateify savable
 type Route struct {
+	RouteEntry
+
 	// Destination must contain the target address for this row to be viable.
 	Destination Subnet
 
@@ -1226,23 +1534,32 @@ type Route struct {
 
 	// NIC is the id of the nic to be used if this row is viable.
 	NIC NICID
+
+	// SourceHint indicates a preferred source address to use when NICs
+	// have multiple addresses.
+	SourceHint Address
+
+	// MTU is the maximum transmission unit to use for this route.
+	// If MTU is 0, this field is ignored and the MTU of the NIC for which this route
+	// is configured is used for egress packets.
+	MTU uint32
 }
 
 // String implements the fmt.Stringer interface.
 func (r Route) String() string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "%s", r.Destination)
-	if len(r.Gateway) > 0 {
-		fmt.Fprintf(&out, " via %s", r.Gateway)
+	_, _ = fmt.Fprintf(&out, "%s", r.Destination)
+	if r.Gateway.length > 0 {
+		_, _ = fmt.Fprintf(&out, " via %s", r.Gateway)
 	}
-	fmt.Fprintf(&out, " nic %d", r.NIC)
+	_, _ = fmt.Fprintf(&out, " nic %d", r.NIC)
 	return out.String()
 }
 
 // Equal returns true if the given Route is equal to this Route.
 func (r Route) Equal(to Route) bool {
 	// NOTE: This relies on the fact that r.Destination == to.Destination
-	return r == to
+	return r.Destination.Equal(to.Destination) && r.NIC == to.NIC
 }
 
 // TransportProtocolNumber is the number of a transport protocol.
@@ -1255,8 +1572,10 @@ type TransportProtocolNumber uint32
 type NetworkProtocolNumber uint32
 
 // A StatCounter keeps track of a statistic.
+//
+// +stateify savable
 type StatCounter struct {
-	count atomicbitops.AlignedAtomicUint64
+	count atomicbitops.Uint64
 }
 
 // Increment adds one to the counter.
@@ -1270,7 +1589,7 @@ func (s *StatCounter) Decrement() {
 }
 
 // Value returns the current value of the counter.
-func (s *StatCounter) Value(name ...string) uint64 {
+func (s *StatCounter) Value() uint64 {
 	return s.count.Load()
 }
 
@@ -1284,8 +1603,11 @@ func (s *StatCounter) String() string {
 }
 
 // A MultiCounterStat keeps track of two counters at once.
+//
+// +stateify savable
 type MultiCounterStat struct {
-	a, b *StatCounter
+	a *StatCounter
+	b *StatCounter
 }
 
 // Init sets both internal counters to point to a and b.
@@ -1307,6 +1629,8 @@ func (m *MultiCounterStat) IncrementBy(v uint64) {
 }
 
 // ICMPv4PacketStats enumerates counts for all ICMPv4 packet types.
+//
+// +stateify savable
 type ICMPv4PacketStats struct {
 	// LINT.IfChange(ICMPv4PacketStats)
 
@@ -1348,6 +1672,8 @@ type ICMPv4PacketStats struct {
 }
 
 // ICMPv4SentPacketStats collects outbound ICMPv4-specific stats.
+//
+// +stateify savable
 type ICMPv4SentPacketStats struct {
 	// LINT.IfChange(ICMPv4SentPacketStats)
 
@@ -1364,6 +1690,8 @@ type ICMPv4SentPacketStats struct {
 }
 
 // ICMPv4ReceivedPacketStats collects inbound ICMPv4-specific stats.
+//
+// +stateify savable
 type ICMPv4ReceivedPacketStats struct {
 	// LINT.IfChange(ICMPv4ReceivedPacketStats)
 
@@ -1376,6 +1704,8 @@ type ICMPv4ReceivedPacketStats struct {
 }
 
 // ICMPv4Stats collects ICMPv4-specific stats.
+//
+// +stateify savable
 type ICMPv4Stats struct {
 	// LINT.IfChange(ICMPv4Stats)
 
@@ -1389,6 +1719,8 @@ type ICMPv4Stats struct {
 }
 
 // ICMPv6PacketStats enumerates counts for all ICMPv6 packet types.
+//
+// +stateify savable
 type ICMPv6PacketStats struct {
 	// LINT.IfChange(ICMPv6PacketStats)
 
@@ -1434,6 +1766,10 @@ type ICMPv6PacketStats struct {
 	// counted.
 	MulticastListenerReport *StatCounter
 
+	// MulticastListenerReportV2 is the number of Multicast Listener Report
+	// messages counted.
+	MulticastListenerReportV2 *StatCounter
+
 	// MulticastListenerDone is the number of Multicast Listener Done messages
 	// counted.
 	MulticastListenerDone *StatCounter
@@ -1442,6 +1778,8 @@ type ICMPv6PacketStats struct {
 }
 
 // ICMPv6SentPacketStats collects outbound ICMPv6-specific stats.
+//
+// +stateify savable
 type ICMPv6SentPacketStats struct {
 	// LINT.IfChange(ICMPv6SentPacketStats)
 
@@ -1458,6 +1796,8 @@ type ICMPv6SentPacketStats struct {
 }
 
 // ICMPv6ReceivedPacketStats collects inbound ICMPv6-specific stats.
+//
+// +stateify savable
 type ICMPv6ReceivedPacketStats struct {
 	// LINT.IfChange(ICMPv6ReceivedPacketStats)
 
@@ -1478,6 +1818,8 @@ type ICMPv6ReceivedPacketStats struct {
 }
 
 // ICMPv6Stats collects ICMPv6-specific stats.
+//
+// +stateify savable
 type ICMPv6Stats struct {
 	// LINT.IfChange(ICMPv6Stats)
 
@@ -1491,6 +1833,8 @@ type ICMPv6Stats struct {
 }
 
 // ICMPStats collects ICMP-specific stats (both v4 and v6).
+//
+// +stateify savable
 type ICMPStats struct {
 	// V4 contains the ICMPv4-specifics stats.
 	V4 ICMPv4Stats
@@ -1500,6 +1844,8 @@ type ICMPStats struct {
 }
 
 // IGMPPacketStats enumerates counts for all IGMP packet types.
+//
+// +stateify savable
 type IGMPPacketStats struct {
 	// LINT.IfChange(IGMPPacketStats)
 
@@ -1514,6 +1860,10 @@ type IGMPPacketStats struct {
 	// counted.
 	V2MembershipReport *StatCounter
 
+	// V3MembershipReport is the number of Version 3 Membership Report messages
+	// counted.
+	V3MembershipReport *StatCounter
+
 	// LeaveGroup is the number of Leave Group messages counted.
 	LeaveGroup *StatCounter
 
@@ -1521,6 +1871,8 @@ type IGMPPacketStats struct {
 }
 
 // IGMPSentPacketStats collects outbound IGMP-specific stats.
+//
+// +stateify savable
 type IGMPSentPacketStats struct {
 	// LINT.IfChange(IGMPSentPacketStats)
 
@@ -1533,6 +1885,8 @@ type IGMPSentPacketStats struct {
 }
 
 // IGMPReceivedPacketStats collects inbound IGMP-specific stats.
+//
+// +stateify savable
 type IGMPReceivedPacketStats struct {
 	// LINT.IfChange(IGMPReceivedPacketStats)
 
@@ -1545,13 +1899,15 @@ type IGMPReceivedPacketStats struct {
 	ChecksumErrors *StatCounter
 
 	// Unrecognized is the number of unrecognized messages counted, these are
-	// silently ignored for forward-compatibilty.
+	// silently ignored for forward-compatibility.
 	Unrecognized *StatCounter
 
 	// LINT.ThenChange(network/ipv4/stats.go:multiCounterIGMPReceivedPacketStats)
 }
 
 // IGMPStats collects IGMP-specific stats.
+//
+// +stateify savable
 type IGMPStats struct {
 	// LINT.IfChange(IGMPStats)
 
@@ -1565,6 +1921,8 @@ type IGMPStats struct {
 }
 
 // IPForwardingStats collects stats related to IP forwarding (both v4 and v6).
+//
+// +stateify savable
 type IPForwardingStats struct {
 	// LINT.IfChange(IPForwardingStats)
 
@@ -1575,6 +1933,11 @@ type IPForwardingStats struct {
 	// ExhaustedTTL is the number of IP packets received which were dropped
 	// because their TTL was exhausted.
 	ExhaustedTTL *StatCounter
+
+	// InitializingSource is the number of IP packets which were dropped
+	// because they contained a source address that may only be used on the local
+	// network as part of initialization work.
+	InitializingSource *StatCounter
 
 	// LinkLocalSource is the number of IP packets which were dropped
 	// because they contained a link-local source address.
@@ -1597,14 +1960,37 @@ type IPForwardingStats struct {
 	// header.
 	ExtensionHeaderProblem *StatCounter
 
+	// UnexpectedMulticastInputInterface is the number of multicast packets that
+	// were received on an interface that did not match the corresponding route's
+	// expected input interface.
+	UnexpectedMulticastInputInterface *StatCounter
+
+	// UnknownOutputEndpoint is the number of packets that could not be forwarded
+	// because the output endpoint could not be found.
+	UnknownOutputEndpoint *StatCounter
+
+	// NoMulticastPendingQueueBufferSpace is the number of multicast packets that
+	// were dropped due to insufficient buffer space in the pending packet queue.
+	NoMulticastPendingQueueBufferSpace *StatCounter
+
+	// OutgoingDeviceNoBufferSpace is the number of packets that were dropped due
+	// to insufficient space in the outgoing device.
+	OutgoingDeviceNoBufferSpace *StatCounter
+
 	// Errors is the number of IP packets received which could not be
 	// successfully forwarded.
 	Errors *StatCounter
 
-	// LINT.ThenChange(network/internal/ip/stats.go:multiCounterIPForwardingStats)
+	// OutgoingDeviceClosedForSend is the number of packets that were dropped due
+	// to the outgoing device being closed for send.
+	OutgoingDeviceClosedForSend *StatCounter
+
+	// LINT.ThenChange(network/internal/ip/stats.go:MultiCounterIPForwardingStats)
 }
 
 // IPStats collects IP-specific stats (both v4 and v6).
+//
+// +stateify savable
 type IPStats struct {
 	// LINT.IfChange(IPStats)
 
@@ -1687,6 +2073,8 @@ type IPStats struct {
 }
 
 // ARPStats collects ARP-specific stats.
+//
+// +stateify savable
 type ARPStats struct {
 	// LINT.IfChange(ARPStats)
 
@@ -1740,6 +2128,8 @@ type ARPStats struct {
 }
 
 // TCPStats collects TCP-specific stats.
+//
+// +stateify savable
 type TCPStats struct {
 	// ActiveConnectionOpenings is the number of connections opened
 	// successfully via Connect.
@@ -1849,9 +2239,23 @@ type TCPStats struct {
 	// SegmentsAckedWithDSACK is the number of segments acknowledged with
 	// DSACK.
 	SegmentsAckedWithDSACK *StatCounter
+
+	// SpuriousRecovery is the number of times the connection entered loss
+	// recovery spuriously.
+	SpuriousRecovery *StatCounter
+
+	// SpuriousRTORecovery is the number of spurious RTOs.
+	SpuriousRTORecovery *StatCounter
+
+	// ForwardMaxInFlightDrop is the number of connection requests that are
+	// dropped due to exceeding the maximum number of in-flight connection
+	// requests.
+	ForwardMaxInFlightDrop *StatCounter
 }
 
 // UDPStats collects UDP-specific stats.
+//
+// +stateify savable
 type UDPStats struct {
 	// PacketsReceived is the number of UDP datagrams received via
 	// HandlePacket.
@@ -1880,6 +2284,8 @@ type UDPStats struct {
 }
 
 // NICNeighborStats holds metrics for the neighbor table.
+//
+// +stateify savable
 type NICNeighborStats struct {
 	// LINT.IfChange(NICNeighborStats)
 
@@ -1887,10 +2293,22 @@ type NICNeighborStats struct {
 	// entry in Unreachable state.
 	UnreachableEntryLookups *StatCounter
 
+	// DroppedConfirmationForNoninitiatedNeighbor counts the number of neighbor
+	// responses that were dropped because they didn't match an entry in the
+	// cache.
+	DroppedConfirmationForNoninitiatedNeighbor *StatCounter
+
+	// DroppedInvalidLinkAddressConfirmations counts the number of neighbor
+	// responses that were ignored because they had an invalid source link-layer
+	// address.
+	DroppedInvalidLinkAddressConfirmations *StatCounter
+
 	// LINT.ThenChange(stack/nic_stats.go:multiCounterNICNeighborStats)
 }
 
 // NICPacketStats holds basic packet statistics.
+//
+// +stateify savable
 type NICPacketStats struct {
 	// LINT.IfChange(NICPacketStats)
 
@@ -1903,17 +2321,95 @@ type NICPacketStats struct {
 	// LINT.ThenChange(stack/nic_stats.go:multiCounterNICPacketStats)
 }
 
+// IntegralStatCounterMap holds a map associating integral keys with
+// StatCounters.
+//
+// +stateify savable
+type IntegralStatCounterMap struct {
+	mu sync.RWMutex `state:"nosave"`
+	// +checklocks:mu
+	counterMap map[uint64]*StatCounter
+}
+
+// Keys returns all keys present in the map.
+func (m *IntegralStatCounterMap) Keys() []uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var keys []uint64
+	for k := range m.counterMap {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// Get returns the counter mapped by the provided key.
+func (m *IntegralStatCounterMap) Get(key uint64) (*StatCounter, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	counter, ok := m.counterMap[key]
+	return counter, ok
+}
+
+// Init initializes the map.
+func (m *IntegralStatCounterMap) Init() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.counterMap = make(map[uint64]*StatCounter)
+}
+
+// Increment increments the counter associated with the provided key.
+func (m *IntegralStatCounterMap) Increment(key uint64) {
+	m.mu.RLock()
+	counter, ok := m.counterMap[key]
+	m.mu.RUnlock()
+
+	if !ok {
+		m.mu.Lock()
+		counter, ok = m.counterMap[key]
+		if !ok {
+			counter = new(StatCounter)
+			m.counterMap[key] = counter
+		}
+		m.mu.Unlock()
+	}
+	counter.Increment()
+}
+
+// A MultiIntegralStatCounterMap keeps track of two integral counter maps at
+// once.
+//
+// +stateify savable
+type MultiIntegralStatCounterMap struct {
+	a *IntegralStatCounterMap
+	b *IntegralStatCounterMap
+}
+
+// Init sets the internal integral counter maps to point to a and b.
+func (m *MultiIntegralStatCounterMap) Init(a, b *IntegralStatCounterMap) {
+	m.a = a
+	m.b = b
+}
+
+// Increment increments the counter in each map corresponding to the
+// provided key.
+func (m *MultiIntegralStatCounterMap) Increment(key uint64) {
+	m.a.Increment(key)
+	m.b.Increment(key)
+}
+
 // NICStats holds NIC statistics.
+//
+// +stateify savable
 type NICStats struct {
 	// LINT.IfChange(NICStats)
 
-	// UnknownL3ProtocolRcvdPackets is the number of packets received that were
-	// for an unknown or unsupported network protocol.
-	UnknownL3ProtocolRcvdPackets *StatCounter
+	// UnknownL3ProtocolRcvdPacketCounts records the number of packets received
+	// for each unknown or unsupported network protocol number.
+	UnknownL3ProtocolRcvdPacketCounts *IntegralStatCounterMap
 
-	// UnknownL4ProtocolRcvdPackets is the number of packets received that were
-	// for an unknown or unsupported transport protocol.
-	UnknownL4ProtocolRcvdPackets *StatCounter
+	// UnknownL4ProtocolRcvdPacketCounts records the number of packets received
+	// for each unknown or unsupported transport protocol number.
+	UnknownL4ProtocolRcvdPacketCounts *IntegralStatCounterMap
 
 	// MalformedL4RcvdPackets is the number of packets received by a NIC that
 	// could not be delivered to a transport endpoint because the L4 header could
@@ -1922,6 +2418,13 @@ type NICStats struct {
 
 	// Tx contains statistics about transmitted packets.
 	Tx NICPacketStats
+
+	// TxPacketsDroppedNoBufferSpace is the number of packets dropepd due to the
+	// NIC not having enough buffer space to send the packet.
+	//
+	// Packets may be dropped with a no buffer space error when the device TX
+	// queue is full.
+	TxPacketsDroppedNoBufferSpace *StatCounter
 
 	// Rx contains statistics about received packets.
 	Rx NICPacketStats
@@ -1942,6 +2445,8 @@ func (s NICStats) FillIn() NICStats {
 }
 
 // Stats holds statistics about the networking stack.
+//
+// +stateify savable
 type Stats struct {
 	// TODO(https://gvisor.dev/issues/5986): Make the DroppedPackets stat less
 	// ambiguous.
@@ -1981,6 +2486,8 @@ type Stats struct {
 }
 
 // ReceiveErrors collects packet receive errors within transport endpoint.
+//
+// +stateify savable
 type ReceiveErrors struct {
 	// ReceiveBufferOverflow is the number of received packets dropped
 	// due to the receive buffer being full.
@@ -1998,8 +2505,10 @@ type ReceiveErrors struct {
 	ChecksumErrors StatCounter
 }
 
-// SendErrors collects packet send errors within the transport layer for
-// an endpoint.
+// SendErrors collects packet send errors within the transport layer for an
+// endpoint.
+//
+// +stateify savable
 type SendErrors struct {
 	// SendToNetworkFailed is the number of packets failed to be written to
 	// the network endpoint.
@@ -2010,6 +2519,8 @@ type SendErrors struct {
 }
 
 // ReadErrors collects segment read errors from an endpoint read call.
+//
+// +stateify savable
 type ReadErrors struct {
 	// ReadClosed is the number of received packet drops because the endpoint
 	// was shutdown for read.
@@ -2025,6 +2536,8 @@ type ReadErrors struct {
 }
 
 // WriteErrors collects packet write errors from an endpoint write call.
+//
+// +stateify savable
 type WriteErrors struct {
 	// WriteClosed is the number of packet drops because the endpoint
 	// was shutdown for write.
@@ -2040,6 +2553,8 @@ type WriteErrors struct {
 }
 
 // TransportEndpointStats collects statistics about the endpoint.
+//
+// +stateify savable
 type TransportEndpointStats struct {
 	// PacketsReceived is the number of successful packet receives.
 	PacketsReceived StatCounter
@@ -2073,6 +2588,11 @@ func InitStatCounters(v reflect.Value) {
 			if *s == nil {
 				*s = new(StatCounter)
 			}
+		} else if s, ok := v.Addr().Interface().(**IntegralStatCounterMap); ok {
+			if *s == nil {
+				*s = new(IntegralStatCounterMap)
+				(*s).Init()
+			}
 		} else {
 			InitStatCounters(v)
 		}
@@ -2085,12 +2605,10 @@ func (s Stats) FillIn() Stats {
 	return s
 }
 
-// Clone returns a copy of the TransportEndpointStats by atomically reading
-// each field.
-func (src *TransportEndpointStats) Clone() TransportEndpointStats {
-	var dst TransportEndpointStats
-	clone(reflect.ValueOf(&dst).Elem(), reflect.ValueOf(src).Elem())
-	return dst
+// Clone clones a copy of the TransportEndpointStats into dst by atomically
+// reading each field.
+func (src *TransportEndpointStats) Clone(dst *TransportEndpointStats) {
+	clone(reflect.ValueOf(dst).Elem(), reflect.ValueOf(src).Elem())
 }
 
 func clone(dst reflect.Value, src reflect.Value) {
@@ -2107,15 +2625,15 @@ func clone(dst reflect.Value, src reflect.Value) {
 
 // String implements the fmt.Stringer interface.
 func (a Address) String() string {
-	switch len(a) {
+	switch l := a.Len(); l {
 	case 4:
-		return fmt.Sprintf("%d.%d.%d.%d", int(a[0]), int(a[1]), int(a[2]), int(a[3]))
+		return fmt.Sprintf("%d.%d.%d.%d", int(a.addr[0]), int(a.addr[1]), int(a.addr[2]), int(a.addr[3]))
 	case 16:
 		// Find the longest subsequence of hexadecimal zeros.
 		start, end := -1, -1
-		for i := 0; i < len(a); i += 2 {
+		for i := 0; i < a.Len(); i += 2 {
 			j := i
-			for j < len(a) && a[j] == 0 && a[j+1] == 0 {
+			for j < a.Len() && a.addr[j] == 0 && a.addr[j+1] == 0 {
 				j += 2
 			}
 			if j > i+2 && j-i > end-start {
@@ -2124,17 +2642,17 @@ func (a Address) String() string {
 		}
 
 		var b strings.Builder
-		for i := 0; i < len(a); i += 2 {
+		for i := 0; i < a.Len(); i += 2 {
 			if i == start {
 				b.WriteString("::")
 				i = end
-				if end >= len(a) {
+				if end >= a.Len() {
 					break
 				}
 			} else if i > 0 {
 				b.WriteByte(':')
 			}
-			v := uint16(a[i+0])<<8 | uint16(a[i+1])
+			v := uint16(a.addr[i+0])<<8 | uint16(a.addr[i+1])
 			if v == 0 {
 				b.WriteByte('0')
 			} else {
@@ -2148,33 +2666,33 @@ func (a Address) String() string {
 		}
 		return b.String()
 	default:
-		return fmt.Sprintf("%x", []byte(a))
+		return fmt.Sprintf("%x", a.addr[:l])
 	}
 }
 
 // To4 converts the IPv4 address to a 4-byte representation.
-// If the address is not an IPv4 address, To4 returns "".
+// If the address is not an IPv4 address, To4 returns the empty Address.
 func (a Address) To4() Address {
 	const (
 		ipv4len = 4
 		ipv6len = 16
 	)
-	if len(a) == ipv4len {
+	if a.Len() == ipv4len {
 		return a
 	}
-	if len(a) == ipv6len &&
-		isZeros(a[0:10]) &&
-		a[10] == 0xff &&
-		a[11] == 0xff {
-		return a[12:16]
+	if a.Len() == ipv6len &&
+		isZeros(a.addr[:10]) &&
+		a.addr[10] == 0xff &&
+		a.addr[11] == 0xff {
+		return AddrFrom4Slice(a.addr[12:16])
 	}
-	return ""
+	return Address{}
 }
 
-// isZeros reports whether a is all zeros.
-func isZeros(a Address) bool {
-	for i := 0; i < len(a); i++ {
-		if a[i] != 0 {
+// isZeros reports whether addr is all zeros.
+func isZeros(addr []byte) bool {
+	for _, b := range addr {
+		if b != 0 {
 			return false
 		}
 	}
@@ -2202,7 +2720,7 @@ func ParseMACAddress(s string) (LinkAddress, error) {
 	parts := strings.FieldsFunc(s, func(c rune) bool {
 		return c == ':' || c == '-'
 	})
-	if len(parts) != 6 {
+	if len(parts) != LinkAddressSize {
 		return "", fmt.Errorf("inconsistent parts: %s", s)
 	}
 	addr := make([]byte, 0, len(parts))
@@ -2216,7 +2734,18 @@ func ParseMACAddress(s string) (LinkAddress, error) {
 	return LinkAddress(addr), nil
 }
 
+// GetRandMacAddr returns a mac address that can be used for local virtual devices.
+func GetRandMacAddr() LinkAddress {
+	mac := make(net.HardwareAddr, LinkAddressSize)
+	rand.Read(mac) // Fill with random data.
+	mac[0] &^= 0x1 // Clear multicast bit.
+	mac[0] |= 0x2  // Set local assignment bit (IEEE802).
+	return LinkAddress(mac)
+}
+
 // AddressWithPrefix is an address with its subnet prefix length.
+//
+// +stateify savable
 type AddressWithPrefix struct {
 	// Address is a network address.
 	Address Address
@@ -2232,39 +2761,43 @@ func (a AddressWithPrefix) String() string {
 
 // Subnet converts the address and prefix into a Subnet value and returns it.
 func (a AddressWithPrefix) Subnet() Subnet {
-	addrLen := len(a.Address)
+	addrLen := a.Address.length
 	if a.PrefixLen <= 0 {
 		return Subnet{
-			address: Address(strings.Repeat("\x00", addrLen)),
-			mask:    AddressMask(strings.Repeat("\x00", addrLen)),
+			address: Address{length: addrLen},
+			mask:    AddressMask{length: addrLen},
 		}
 	}
 	if a.PrefixLen >= addrLen*8 {
-		return Subnet{
+		sub := Subnet{
 			address: a.Address,
-			mask:    AddressMask(strings.Repeat("\xff", addrLen)),
+			mask:    AddressMask{length: addrLen},
 		}
+		for i := 0; i < addrLen; i++ {
+			sub.mask.mask[i] = 0xff
+		}
+		return sub
 	}
 
-	sa := make([]byte, addrLen)
-	sm := make([]byte, addrLen)
+	sa := Address{length: addrLen}
+	sm := AddressMask{length: addrLen}
 	n := uint(a.PrefixLen)
 	for i := 0; i < addrLen; i++ {
 		if n >= 8 {
-			sa[i] = a.Address[i]
-			sm[i] = 0xff
+			sa.addr[i] = a.Address.addr[i]
+			sm.mask[i] = 0xff
 			n -= 8
 			continue
 		}
-		sm[i] = ^byte(0xff >> n)
-		sa[i] = a.Address[i] & sm[i]
+		sm.mask[i] = ^byte(0xff >> n)
+		sa.addr[i] = a.Address.addr[i] & sm.mask[i]
 		n = 0
 	}
 
 	// For extra caution, call NewSubnet rather than directly creating the Subnet
 	// value. If that fails it indicates a serious bug in this code, so panic is
 	// in order.
-	s, err := NewSubnet(Address(sa), AddressMask(sm))
+	s, err := NewSubnet(sa, sm)
 	if err != nil {
 		panic("invalid subnet: " + err.Error())
 	}
@@ -2273,6 +2806,8 @@ func (a AddressWithPrefix) Subnet() Subnet {
 
 // ProtocolAddress is an address and the network protocol it is associated
 // with.
+//
+// +stateify savable
 type ProtocolAddress struct {
 	// Protocol is the protocol of the address.
 	Protocol NetworkProtocolNumber
@@ -2298,6 +2833,18 @@ func GetDanglingEndpoints() []Endpoint {
 	}
 	danglingEndpointsMu.Unlock()
 	return es
+}
+
+// ReleaseDanglingEndpoints clears out all all reference counted objects held by
+// dangling endpoints.
+func ReleaseDanglingEndpoints() {
+	// Get the dangling endpoints first to avoid locking around Release(), which
+	// can cause a lock inversion with endpoint.mu and danglingEndpointsMu.
+	// Calling Release on a dangling endpoint that has been deleted is a noop.
+	eps := GetDanglingEndpoints()
+	for _, ep := range eps {
+		ep.Abort()
+	}
 }
 
 // AddDanglingEndpoint adds a dangling endpoint.

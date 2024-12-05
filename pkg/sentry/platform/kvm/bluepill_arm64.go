@@ -18,15 +18,23 @@
 package kvm
 
 import (
+	"fmt"
+
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sighandling"
 )
 
 var (
 	// The action for bluepillSignal is changed by sigaction().
 	bluepillSignal = unix.SIGILL
 )
+
+// bluepill enters guest mode.
+//
+//go:nosplit
+func bluepill(c *vCPU)
 
 // getTLS returns the value of TPIDR_EL0 register.
 //
@@ -70,7 +78,7 @@ func bluepillArchExit(c *vCPU, context *arch.SignalContext64) {
 
 	lazyVfp := c.GetLazyVFP()
 	if lazyVfp != 0 {
-		fpsimd := fpsimdPtr(c.floatingPointState.BytePointer())
+		fpsimd := fpsimdPtr(c.FloatingPointState().BytePointer()) // escapes: no
 		context.Fpsimd64.Fpsr = fpsimd.Fpsr
 		context.Fpsimd64.Fpcr = fpsimd.Fpcr
 		context.Fpsimd64.Vregs = fpsimd.Vregs
@@ -90,12 +98,12 @@ func (c *vCPU) KernelSyscall() {
 
 	fpDisableTrap := ring0.CPACREL1()
 	if fpDisableTrap != 0 {
-		fpsimd := fpsimdPtr(c.floatingPointState.BytePointer())
+		fpsimd := fpsimdPtr(c.FloatingPointState().BytePointer()) // escapes: no
 		fpcr := ring0.GetFPCR()
 		fpsr := ring0.GetFPSR()
 		fpsimd.Fpcr = uint32(fpcr)
 		fpsimd.Fpsr = uint32(fpsr)
-		ring0.SaveVRegs(c.floatingPointState.BytePointer())
+		ring0.SaveVRegs(c.FloatingPointState().BytePointer()) // escapes: no
 	}
 
 	ring0.Halt()
@@ -114,13 +122,26 @@ func (c *vCPU) KernelException(vector ring0.Vector) {
 
 	fpDisableTrap := ring0.CPACREL1()
 	if fpDisableTrap != 0 {
-		fpsimd := fpsimdPtr(c.floatingPointState.BytePointer())
+		fpsimd := fpsimdPtr(c.FloatingPointState().BytePointer()) // escapes: no
 		fpcr := ring0.GetFPCR()
 		fpsr := ring0.GetFPSR()
 		fpsimd.Fpcr = uint32(fpcr)
 		fpsimd.Fpsr = uint32(fpsr)
-		ring0.SaveVRegs(c.floatingPointState.BytePointer())
+		ring0.SaveVRegs(c.FloatingPointState().BytePointer()) // escapes: no
 	}
 
 	ring0.Halt()
+}
+
+// hltSanityCheck verifies the current state to detect obvious corruption.
+//
+//go:nosplit
+func (c *vCPU) hltSanityCheck() {
+}
+
+func init() {
+	// Install the handler.
+	if err := sighandling.ReplaceSignalHandler(bluepillSignal, addrOfSighandler(), &savedHandler); err != nil {
+		panic(fmt.Sprintf("Unable to set handler for signal %d: %v", bluepillSignal, err))
+	}
 }
