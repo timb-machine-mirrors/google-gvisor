@@ -314,6 +314,19 @@ func validateArray[T any](field, cName string, oldArr, newArr []T) error {
 	return nil
 }
 
+func validateMap[K comparable, V comparable](field, cName string, oldM map[K]V, newM map[K]V) error {
+	if len(oldM) != len(newM) {
+		return validateError(field, cName, oldM, newM)
+	}
+	for k, v1 := range oldM {
+		v2, ok := newM[k]
+		if !ok || v1 != v2 {
+			return validateError(field, cName, oldM, newM)
+		}
+	}
+	return nil
+}
+
 func sortCapabilities(o *specs.LinuxCapabilities) {
 	sort.Strings(o.Bounding)
 	sort.Strings(o.Effective)
@@ -347,7 +360,7 @@ func validateResources(field, cName string, oldR, newR *specs.LinuxResources) er
 	before := *oldR
 	after := *newR
 	if err := validateArray(field+".HugepageLimits", cName, before.HugepageLimits, after.HugepageLimits); err != nil {
-		return validateError(field, cName, oldR, newR)
+		return validateError(field+".HugepageLimits", cName, oldR, newR)
 	}
 	before.HugepageLimits, after.HugepageLimits = nil, nil
 
@@ -355,6 +368,15 @@ func validateResources(field, cName string, oldR, newR *specs.LinuxResources) er
 	// versions of the devices can change across checkpoint restore. Mark them
 	// to nil as there is no need to validate each device.
 	before.Devices, after.Devices = nil, nil
+
+	if err := validateMap(field+".Rdma", cName, before.Rdma, after.Rdma); err != nil {
+		return err
+	}
+	before.Rdma, after.Rdma = nil, nil
+	if err := validateMap(field+".Unified", cName, before.Unified, after.Unified); err != nil {
+		return err
+	}
+	before.Unified, after.Unified = nil, nil
 
 	if !reflect.DeepEqual(before, after) {
 		return validateError(field, cName, oldR, newR)
@@ -431,9 +453,14 @@ func validateSpecForContainer(oSpec, nSpec *specs.Spec, cName string) error {
 	if oldProcess.Cwd != newProcess.Cwd {
 		return validateError("Cwd", cName, oldProcess.Cwd, newProcess.Cwd)
 	}
-	validateStructMap := make(map[string][2]any)
-	validateStructMap["User"] = [2]any{oldProcess.User, newProcess.User}
-	validateStructMap["Rlimits"] = [2]any{oldProcess.Rlimits, newProcess.Rlimits}
+	if err := validateStruct("User", cName, oldProcess.User, newProcess.User); err != nil {
+		return err
+	}
+	oldProcess.User, newProcess.User = specs.User{}, specs.User{}
+	if err := validateArray("Rlimits", cName, oldProcess.Rlimits, newProcess.Rlimits); err != nil {
+		return err
+	}
+	oldProcess.Rlimits, newProcess.Rlimits = nil, nil
 	if ok := slices.Equal(oldProcess.Args, newProcess.Args); !ok {
 		return validateError("Args", cName, oldProcess.Args, newProcess.Args)
 	}
@@ -445,14 +472,22 @@ func validateSpecForContainer(oSpec, nSpec *specs.Spec, cName string) error {
 	// Validate specs.Linux.
 	oldSpec.Linux, newSpec.Linux = ifNil(oldSpec.Linux), ifNil(newSpec.Linux)
 	oldLinux, newLinux := *oldSpec.Linux, *newSpec.Linux
-	validateStructMap["Sysctl"] = [2]any{oldLinux.Sysctl, newLinux.Sysctl}
-	validateStructMap["Seccomp"] = [2]any{oldLinux.Seccomp, newLinux.Seccomp}
+	if err := validateMap("Sysctl", cName, oldLinux.Sysctl, newLinux.Sysctl); err != nil {
+		return err
+	}
+	oldLinux.Sysctl, newLinux.Sysctl = nil, nil
+	if err := validateStruct("Seccomp", cName, oldLinux.Seccomp, newLinux.Seccomp); err != nil {
+		return err
+	}
+	oldLinux.Seccomp, newLinux.Seccomp = nil, nil
 	if err := validateDevices("Devices", cName, oldLinux.Devices, newLinux.Devices); err != nil {
 		return err
 	}
 	oldLinux.Devices, newLinux.Devices = nil, nil
 	if err := validateResources("Resources", cName, oldLinux.Resources, newLinux.Resources); err != nil {
-		return err
+		// Resource limits can be changed during restore, log a warning and do not
+		// return error.
+		log.Warningf("specs.Linux.Resources has been changed during restore, err %v", err)
 	}
 	oldLinux.Resources, newLinux.Resources = nil, nil
 	if err := validateArray("UIDMappings", cName, oldLinux.UIDMappings, newLinux.UIDMappings); err != nil {
@@ -467,18 +502,6 @@ func validateSpecForContainer(oSpec, nSpec *specs.Spec, cName string) error {
 		return err
 	}
 	oldLinux.Namespaces, newLinux.Namespaces = nil, nil
-
-	// Validate all the structs collected in validateStructMap above.
-	for key, val := range validateStructMap {
-		if err := validateStruct(key, cName, val[0], val[1]); err != nil {
-			return err
-		}
-	}
-	// Set the fields in validateStructMap to nil after validation.
-	oldProcess.User, newProcess.User = specs.User{}, specs.User{}
-	oldProcess.Rlimits, newProcess.Rlimits = nil, nil
-	oldLinux.Sysctl, newLinux.Sysctl = nil, nil
-	oldLinux.Seccomp, newLinux.Seccomp = nil, nil
 
 	// Hostname, Domainname, Environment variables and CgroupsPath are
 	// allowed to change during restore. Hooks contain callbacks for
@@ -712,7 +735,8 @@ func (r *restorer) restore(l *Loader) error {
 		// Restore was successful, so increment the checkpoint count manually. The
 		// count was saved while the previous kernel was being saved and checkpoint
 		// success was unknown at that time. Now we know the checkpoint succeeded.
-		l.k.IncCheckpointCount()
+		l.k.OnRestoreDone()
+
 		log.Infof("Restore successful")
 	}()
 	return nil
@@ -723,7 +747,6 @@ func (l *Loader) save(o *control.SaveOpts) (err error) {
 		// This closure is required to capture the final value of err.
 		l.k.OnCheckpointAttempt(err)
 	}()
-	l.k.ResetCheckpointStatus()
 
 	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
 	if l.root.conf.Network == config.NetworkHost {

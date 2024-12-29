@@ -425,7 +425,8 @@ func (k *Kernel) StateFields() []string {
 		"MaxFDLimit",
 		"containerNames",
 		"additionalCheckpointState",
-		"checkpointCounter",
+		"CheckpointWait",
+		"checkpointGen",
 		"UnixSocketOpts",
 	}
 }
@@ -478,8 +479,9 @@ func (k *Kernel) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(38, &k.MaxFDLimit)
 	stateSinkObject.Save(39, &k.containerNames)
 	stateSinkObject.Save(40, &k.additionalCheckpointState)
-	stateSinkObject.Save(41, &k.checkpointCounter)
-	stateSinkObject.Save(42, &k.UnixSocketOpts)
+	stateSinkObject.Save(41, &k.CheckpointWait)
+	stateSinkObject.Save(42, &k.checkpointGen)
+	stateSinkObject.Save(43, &k.UnixSocketOpts)
 }
 
 func (k *Kernel) afterLoad(context.Context) {}
@@ -526,8 +528,9 @@ func (k *Kernel) StateLoad(ctx context.Context, stateSourceObject state.Source) 
 	stateSourceObject.Load(38, &k.MaxFDLimit)
 	stateSourceObject.Load(39, &k.containerNames)
 	stateSourceObject.Load(40, &k.additionalCheckpointState)
-	stateSourceObject.Load(41, &k.checkpointCounter)
-	stateSourceObject.Load(42, &k.UnixSocketOpts)
+	stateSourceObject.Load(41, &k.CheckpointWait)
+	stateSourceObject.Load(42, &k.checkpointGen)
+	stateSourceObject.Load(43, &k.UnixSocketOpts)
 	stateSourceObject.LoadValue(21, new([]tcpip.Endpoint), func(y any) { k.loadDanglingEndpoints(ctx, y.([]tcpip.Endpoint)) })
 }
 
@@ -585,6 +588,59 @@ func (s *SocketRecord) StateLoad(ctx context.Context, stateSourceObject state.So
 	stateSourceObject.Load(0, &s.k)
 	stateSourceObject.Load(1, &s.Sock)
 	stateSourceObject.Load(2, &s.ID)
+}
+
+func (c *CheckpointGeneration) StateTypeName() string {
+	return "pkg/sentry/kernel.CheckpointGeneration"
+}
+
+func (c *CheckpointGeneration) StateFields() []string {
+	return []string{
+		"Count",
+		"Restore",
+	}
+}
+
+func (c *CheckpointGeneration) beforeSave() {}
+
+// +checklocksignore
+func (c *CheckpointGeneration) StateSave(stateSinkObject state.Sink) {
+	c.beforeSave()
+	stateSinkObject.Save(0, &c.Count)
+	stateSinkObject.Save(1, &c.Restore)
+}
+
+func (c *CheckpointGeneration) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (c *CheckpointGeneration) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &c.Count)
+	stateSourceObject.Load(1, &c.Restore)
+}
+
+func (w *CheckpointWaitable) StateTypeName() string {
+	return "pkg/sentry/kernel.CheckpointWaitable"
+}
+
+func (w *CheckpointWaitable) StateFields() []string {
+	return []string{
+		"k",
+	}
+}
+
+func (w *CheckpointWaitable) beforeSave() {}
+
+// +checklocksignore
+func (w *CheckpointWaitable) StateSave(stateSinkObject state.Sink) {
+	w.beforeSave()
+	stateSinkObject.Save(0, &w.k)
+}
+
+func (w *CheckpointWaitable) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (w *CheckpointWaitable) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &w.k)
 }
 
 func (p *pendingSignals) StateTypeName() string {
@@ -1340,6 +1396,7 @@ func (t *Task) StateFields() []string {
 		"userCounters",
 		"sessionKeyring",
 		"Origin",
+		"onDestroyAction",
 	}
 }
 
@@ -1425,6 +1482,7 @@ func (t *Task) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(68, &t.userCounters)
 	stateSinkObject.Save(69, &t.sessionKeyring)
 	stateSinkObject.Save(70, &t.Origin)
+	stateSinkObject.Save(71, &t.onDestroyAction)
 }
 
 // +checklocksignore
@@ -1497,6 +1555,7 @@ func (t *Task) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(68, &t.userCounters)
 	stateSourceObject.Load(69, &t.sessionKeyring)
 	stateSourceObject.Load(70, &t.Origin)
+	stateSourceObject.Load(71, &t.onDestroyAction)
 	stateSourceObject.LoadValue(29, new(*Task), func(y any) { t.loadVforkParent(ctx, y.(*Task)) })
 	stateSourceObject.LoadValue(35, new(*Task), func(y any) { t.loadPtraceTracer(ctx, y.(*Task)) })
 	stateSourceObject.LoadValue(51, new(*taskSeccomp), func(y any) { t.loadSeccomp(ctx, y.(*taskSeccomp)) })
@@ -2590,6 +2649,8 @@ func init() {
 	state.Register((*Kernel)(nil))
 	state.Register((*privateMemoryFileMetadata)(nil))
 	state.Register((*SocketRecord)(nil))
+	state.Register((*CheckpointGeneration)(nil))
+	state.Register((*CheckpointWaitable)(nil))
 	state.Register((*pendingSignals)(nil))
 	state.Register((*pendingSignalQueue)(nil))
 	state.Register((*pendingSignal)(nil))

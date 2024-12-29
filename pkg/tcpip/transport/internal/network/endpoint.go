@@ -35,7 +35,7 @@ import (
 // +stateify savable
 type Endpoint struct {
 	// The following fields must only be set once then never changed.
-	stack       *stack.Stack `state:"manual"`
+	stack       *stack.Stack
 	ops         *tcpip.SocketOptions
 	netProto    tcpip.NetworkProtocolNumber
 	transProto  tcpip.TransportProtocolNumber
@@ -53,7 +53,7 @@ type Endpoint struct {
 	// +checklocks:mu
 	effectiveNetProto tcpip.NetworkProtocolNumber
 	// +checklocks:mu
-	connectedRoute *stack.Route `state:"manual"`
+	connectedRoute *stack.Route `state:"nosave"`
 	// +checklocks:mu
 	multicastMemberships map[multicastMembership]struct{}
 	// +checklocks:mu
@@ -311,7 +311,7 @@ func (c *WriteContext) newPacketBufferLocked(reserveHdrBytes int, data buffer.Bu
 	// https://github.com/torvalds/linux/blob/38d741cb70b/include/net/sock.h#L2519
 	// https://github.com/torvalds/linux/blob/38d741cb70b/net/core/sock.c#L2588
 	var expOptVal uint16
-	if nic, err := c.e.stack.GetNICByID(c.route.OutgoingNIC()); err == nil && nic.ExperimentIPOptionEnabled() {
+	if nic, err := c.e.stack.GetNICByID(c.route.OutgoingNIC()); err == nil && nic.GetExperimentIPOptionEnabled() {
 		expOptVal = c.e.ops.GetExperimentOptionValue()
 	}
 	if c.route.NetProto() == header.IPv6ProtocolNumber && expOptVal != 0 {
@@ -352,7 +352,7 @@ func (c *WriteContext) WritePacket(pkt *stack.PacketBuffer, headerIncluded bool)
 	}
 
 	var expOptVal uint16
-	if nic, err := c.e.stack.GetNICByID(c.route.OutgoingNIC()); err == nil && nic.ExperimentIPOptionEnabled() {
+	if nic, err := c.e.stack.GetNICByID(c.route.OutgoingNIC()); err == nil && nic.GetExperimentIPOptionEnabled() {
 		expOptVal = c.e.ops.GetExperimentOptionValue()
 	}
 
