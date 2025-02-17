@@ -82,14 +82,17 @@ const (
 	TURING_DMA_COPY_A                = 0x0000c5b5
 	TURING_COMPUTE_A                 = 0x0000c5c0
 	HOPPER_USERMODE_A                = 0x0000c661
+	AMPERE_A                         = 0x0000c697
 	AMPERE_DMA_COPY_A                = 0x0000c6b5
 	AMPERE_COMPUTE_A                 = 0x0000c6c0
 	AMPERE_DMA_COPY_B                = 0x0000c7b5
 	AMPERE_COMPUTE_B                 = 0x0000c7c0
 	HOPPER_CHANNEL_GPFIFO_A          = 0x0000c86f
 	HOPPER_DMA_COPY_A                = 0x0000c8b5
+	ADA_A                            = 0x0000c997
 	ADA_COMPUTE_A                    = 0x0000c9c0
 	NV_CONFIDENTIAL_COMPUTE          = 0x0000cb33
+	HOPPER_A                         = 0x0000cb97
 	HOPPER_SEC2_WORK_LAUNCH_A        = 0x0000cba2
 	HOPPER_COMPUTE_A                 = 0x0000cbc0
 )
@@ -359,6 +362,16 @@ type NV_CHANNEL_ALLOC_PARAMS struct {
 	EncryptIv           [CC_CHAN_ALLOC_IV_SIZE_DWORD]uint32
 	DecryptIv           [CC_CHAN_ALLOC_IV_SIZE_DWORD]uint32
 	HmacNonce           [CC_CHAN_ALLOC_NONCE_SIZE_DWORD]uint32
+}
+
+// NV_CHANNEL_ALLOC_PARAMS_V570 is the updated version of
+// NV_CHANNEL_ALLOC_PARAMS since 570.86.15.
+//
+// +marshal
+type NV_CHANNEL_ALLOC_PARAMS_V570 struct {
+	NV_CHANNEL_ALLOC_PARAMS
+	TPCConfigID uint32
+	_           uint32
 }
 
 // NVB0B5_ALLOCATION_PARAMETERS is the alloc param type for TURING_DMA_COPY_A,

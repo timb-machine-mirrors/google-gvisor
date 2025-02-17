@@ -357,7 +357,7 @@ func AllCapabilitiesUint64() uint64 {
 	return rv
 }
 
-// MergeCapabilities merges the capabilites from first and second.
+// MergeCapabilities merges the capabilities from first and second.
 func MergeCapabilities(first, second *specs.LinuxCapabilities) *specs.LinuxCapabilities {
 	return &specs.LinuxCapabilities{
 		Bounding:    mergeUnique(first.Bounding, second.Bounding),
@@ -454,7 +454,7 @@ func capsFromNames(names []string, skipSet map[linux.Capability]struct{}) (auth.
 		if !ok {
 			return 0, fmt.Errorf("unknown capability %q", n)
 		}
-		// Should we skip this capabilty?
+		// Should we skip this capability?
 		if _, ok := skipSet[c]; ok {
 			continue
 		}
@@ -678,7 +678,11 @@ func SafeMount(src, dst, fstype string, flags uintptr, data, procPath string) er
 		return &ErrSymlinkMount{fmt.Errorf("failed to safely mount: expected to open %s, but found %s", dst, target)}
 	}
 
-	return unix.Mount(src, safePath, fstype, flags, data)
+	mountErr := unix.Mount(src, safePath, fstype, flags, data)
+	if mountErr != nil {
+		return fmt.Errorf("mount(%q, %q, %q, %#x, %q) failed: %w", src, safePath, fstype, flags, data, mountErr)
+	}
+	return nil
 }
 
 // RetryEintr retries the function until an error different than EINTR is

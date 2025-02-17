@@ -450,7 +450,7 @@ func rmAllocMemory(fi *frontendIoctlState) (uintptr, error) {
 	case nvgpu.NV01_MEMORY_SYSTEM_OS_DESCRIPTOR:
 		return rmAllocOSDescriptor(fi, &ioctlParams)
 	default:
-		fi.ctx.Warningf("nvproxy: unknown NV_ESC_RM_ALLOC_MEMORY class %v", ioctlParams.Params.HClass)
+		fi.ctx.Warningf("nvproxy: %s for NV_ESC_RM_ALLOC_MEMORY class %v", errUndefinedHandler.Error(), ioctlParams.Params.HClass)
 		return 0, linuxerr.EINVAL
 	}
 }
@@ -1221,6 +1221,13 @@ func rmAllocChannel(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS
 	})
 }
 
+// rmAllocChannelV570 is the same as rmAllocChannel, but for 570.86.15.
+func rmAllocChannelV570(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_ALLOC_PARAMS_V570) {
+		fi.fd.dev.nvp.objAdd(fi.ctx, ioctlParams.HRoot, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace, allocParams.HContextShare)
+	})
+}
+
 func rmAllocContextShare(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CTXSHARE_ALLOCATION_PARAMETERS) {
 		// See
@@ -1298,7 +1305,7 @@ func rmVidHeapControl(fi *frontendIoctlState) (uintptr, error) {
 	case nvgpu.NVOS32_FUNCTION_ALLOC_SIZE:
 		return rmVidHeapControlAllocSize(fi, &ioctlParams)
 	default:
-		fi.ctx.Warningf("nvproxy: unknown VID_HEAP_CONTROL function %d", ioctlParams.Function)
+		fi.ctx.Warningf("nvproxy: %s for VID_HEAP_CONTROL function %d", errUndefinedHandler.Error(), ioctlParams.Function)
 		return 0, linuxerr.EINVAL
 	}
 }
